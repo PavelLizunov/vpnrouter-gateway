@@ -4,6 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::json;
+
 use crate::{config, plan, render};
 
 const SAMPLE: &str = include_str!("../examples/gateway.toml");
@@ -156,11 +158,11 @@ fn unknown_field_is_parse_error() {
 #[test]
 fn render_is_deterministic_and_matches_golden() {
     let cfg = sample();
-    let sb = render::render_sing_box(&cfg);
+    let sb = render::render_sing_box(&cfg, None);
     let nft = render::render_nft(&cfg);
     assert_eq!(
         sb,
-        render::render_sing_box(&cfg),
+        render::render_sing_box(&cfg, None),
         "sing-box render is not deterministic"
     );
     assert_eq!(
@@ -186,7 +188,8 @@ fn render_is_deterministic_and_matches_golden() {
 
 #[test]
 fn sing_box_render_shape() {
-    let v: serde_json::Value = serde_json::from_str(&render::render_sing_box(&sample())).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&render::render_sing_box(&sample(), None)).unwrap();
     assert_eq!(v["route"]["final"], "vpn-out");
     assert_eq!(v["dns"]["final"], "vpn-dns");
     assert_eq!(v["dns"]["strategy"], "ipv4_only");
@@ -265,7 +268,7 @@ fn plan_is_empty_when_current_matches() {
     let d = tmpdir("match");
     std::fs::write(
         d.join("current").join("sing-box.json"),
-        render::render_sing_box(&cfg),
+        render::render_sing_box(&cfg, None),
     )
     .unwrap();
     std::fs::write(
@@ -419,7 +422,7 @@ fn doctor_pure_checks_flag_missing_artifacts_and_drift() {
 
 // ---------- apply / rollback ----------
 
-use crate::apply::{self, NftError, NftExec, Opts};
+use crate::apply::{self, DataPlane, NftError, NftExec, Opts, RestartOutcome, SingBoxCheck};
 
 #[derive(Default)]
 struct FakeNft {
@@ -453,6 +456,26 @@ impl NftExec for FakeNft {
     }
 }
 
+#[derive(Default)]
+struct FakeDataPlane {
+    reject: bool,
+    restarted: bool,
+}
+
+impl DataPlane for FakeDataPlane {
+    fn check_config(&mut self, _config: &Path) -> SingBoxCheck {
+        if self.reject {
+            SingBoxCheck::Rejected("fake sing-box rejection".to_string())
+        } else {
+            SingBoxCheck::Ok
+        }
+    }
+    fn restart(&mut self) -> RestartOutcome {
+        self.restarted = true;
+        RestartOutcome::NotManaged("fake: no service".to_string())
+    }
+}
+
 fn do_apply(
     cfg: &config::GatewayConfig,
     dir: &Path,
@@ -460,9 +483,20 @@ fn do_apply(
     opts: Opts,
     nft: &mut FakeNft,
 ) -> Result<String, crate::error::CliError> {
+    do_apply_dp(cfg, dir, ssh, opts, nft, &mut FakeDataPlane::default())
+}
+
+fn do_apply_dp(
+    cfg: &config::GatewayConfig,
+    dir: &Path,
+    ssh: Option<&str>,
+    opts: Opts,
+    nft: &mut FakeNft,
+    dp: &mut FakeDataPlane,
+) -> Result<String, crate::error::CliError> {
     let (errors, warnings) = config::validate(cfg);
     assert!(errors.is_empty(), "{errors:?}");
-    apply::run(cfg, &warnings, Path::new("x.toml"), dir, ssh, opts, nft)
+    apply::run(cfg, &warnings, Path::new("x.toml"), dir, ssh, opts, nft, dp)
 }
 
 fn yes() -> Opts {
@@ -670,4 +704,175 @@ fn rollback_restores_last_good() {
     );
     assert_eq!(nft.calls, vec!["check nft.rules", "load nft.rules"]);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn apply_singbox_check_rejection_mutates_nothing() {
+    let cfg = sample();
+    let d = tmpdir("apply-sbreject");
+    let mut nft = FakeNft::default();
+    let mut dp = FakeDataPlane {
+        reject: true,
+        ..Default::default()
+    };
+    let err = do_apply_dp(&cfg, &d, None, yes(), &mut nft, &mut dp).unwrap_err();
+    assert_eq!(err.code, "SINGBOX_CHECK_FAILED");
+    assert_eq!(err.exit, 4);
+    assert!(!d.join("current").join("nft.rules").exists());
+    assert!(!d.join("current").join("sing-box.json").exists());
+    assert!(!nft.calls.contains(&"load nft.rules".to_string()));
+    // candidates cleaned up
+    assert!(!d.join("candidate.sing-box.json").exists());
+    assert!(!d.join("candidate.nft.rules").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ---------- subscription / redact ----------
+
+use crate::subscription::{self, base64_decode, parse_subscription, select};
+
+/// Test-only base64 encoder, standard alphabet, so fixtures cross-check the
+/// decoder without a dependency.
+fn b64(data: &str) -> String {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let b = data.as_bytes();
+    let mut out = String::new();
+    for chunk in b.chunks(3) {
+        let n = chunk.len();
+        let triple = (chunk[0] as u32) << 16
+            | (if n > 1 { chunk[1] as u32 } else { 0 }) << 8
+            | (if n > 2 { chunk[2] as u32 } else { 0 });
+        out.push(A[(triple >> 18 & 63) as usize] as char);
+        out.push(A[(triple >> 12 & 63) as usize] as char);
+        out.push(if n > 1 {
+            A[(triple >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if n > 2 {
+            A[(triple & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+const VLESS_REALITY: &str = "vless://b831381d-6324-4d53-ad4f-8cda48b30811@server.example:443?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=PUBKEY123&sid=1a2b&type=tcp&flow=xtls-rprx-vision#Germany%20VLESS";
+
+#[test]
+fn base64_decode_standard_and_urlsafe() {
+    assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
+    assert_eq!(base64_decode("aGVsbG8").unwrap(), b"hello"); // no padding
+    assert_eq!(base64_decode("PGI-").unwrap(), b"<b>"); // url-safe '-' == standard '+'
+    assert_eq!(base64_decode("Pz8_").unwrap(), b"???"); // url-safe '_' == standard '/'
+    assert!(base64_decode("not valid !!!").is_none());
+    // roundtrip via test encoder
+    assert_eq!(base64_decode(&b64("vless://x")).unwrap(), b"vless://x");
+}
+
+#[test]
+fn parse_vless_reality_share_link() {
+    let obs = parse_subscription(VLESS_REALITY).unwrap();
+    assert_eq!(obs.len(), 1);
+    let o = &obs[0];
+    assert_eq!(o.name, "Germany VLESS");
+    let j = &o.outbound;
+    assert_eq!(j["type"], "vless");
+    assert_eq!(j["server"], "server.example");
+    assert_eq!(j["server_port"], 443);
+    assert_eq!(j["uuid"], "b831381d-6324-4d53-ad4f-8cda48b30811");
+    assert_eq!(j["flow"], "xtls-rprx-vision");
+    assert_eq!(j["packet_encoding"], "xudp");
+    assert_eq!(j["tls"]["server_name"], "www.microsoft.com");
+    assert_eq!(j["tls"]["utls"]["fingerprint"], "chrome");
+    assert_eq!(j["tls"]["reality"]["public_key"], "PUBKEY123");
+    assert_eq!(j["tls"]["reality"]["short_id"], "1a2b");
+    assert!(j.get("transport").is_none(), "tcp needs no transport block");
+}
+
+#[test]
+fn parse_base64_wrapped_list_and_select() {
+    let list = format!(
+        "{VLESS_REALITY}\nvless://22222222-2222-2222-2222-222222222222@b.example:8443?security=tls&sni=b.example#Backup"
+    );
+    let obs = parse_subscription(&b64(&list)).unwrap();
+    assert_eq!(obs.len(), 2);
+    assert_eq!(select(&obs, "Germany VLESS").unwrap().name, "Germany VLESS");
+    assert_eq!(
+        select(&obs, "Backup").unwrap().outbound["server"],
+        "b.example"
+    );
+    let err = select(&obs, "Nonexistent").unwrap_err();
+    assert!(err.0.contains("available"), "{}", err.0);
+}
+
+#[test]
+fn parse_singbox_json_passthrough() {
+    let json = r#"{"outbounds":[
+        {"type":"vless","tag":"JP","server":"jp.example","server_port":443,"uuid":"u"},
+        {"type":"direct","tag":"direct"},
+        {"type":"selector","tag":"select","outbounds":["JP"]}
+    ]}"#;
+    let obs = parse_subscription(json).unwrap();
+    assert_eq!(obs.len(), 1, "only proxy outbounds, not direct/selector");
+    assert_eq!(obs[0].name, "JP");
+}
+
+#[test]
+fn parse_unsupported_only_errors() {
+    let err = parse_subscription("hysteria2://x@h:443#H\ntuic://y@h:443#T").unwrap_err();
+    assert!(err.0.contains("no supported outbounds"), "{}", err.0);
+}
+
+#[test]
+fn resolve_cache_roundtrip_and_render() {
+    let d = tmpdir("resolve");
+    let obs = parse_subscription(VLESS_REALITY).unwrap();
+    let chosen = select(&obs, "Germany VLESS").unwrap();
+    subscription::save_cache(&d, "https://sub.example/token123", chosen).unwrap();
+    let resolved = subscription::load_resolved(&d).expect("cache loads");
+    assert_eq!(resolved["server"], "server.example");
+    // cache redacts the source URL
+    let cache: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.join("subscription.json")).unwrap())
+            .unwrap();
+    assert_eq!(cache["source"], "https://sub.example/…");
+    // render uses the resolved outbound, retagged to vpn-out
+    let cfg = sample();
+    let sb: serde_json::Value =
+        serde_json::from_str(&render::render_sing_box(&cfg, Some(&resolved))).unwrap();
+    assert_eq!(sb["outbounds"][0]["tag"], "vpn-out");
+    assert_eq!(sb["outbounds"][0]["server"], "server.example");
+    assert_eq!(sb["route"]["final"], "vpn-out");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn redact_masks_secrets_keeps_diagnostics() {
+    let outbound = json!({
+        "type": "vless",
+        "server": "server.example",
+        "uuid": "b831381d-secret",
+        "tls": { "reality": { "public_key": "PUBKEY", "short_id": "1a2b" } }
+    });
+    let r = crate::redact::redact_value(&outbound);
+    assert_eq!(r["uuid"], "***");
+    assert_eq!(r["tls"]["reality"]["short_id"], "***");
+    assert_eq!(r["type"], "vless"); // diagnostic kept
+    assert_eq!(r["server"], "server.example"); // endpoint kept
+    assert_eq!(r["tls"]["reality"]["public_key"], "PUBKEY"); // public by design
+}
+
+#[test]
+fn redact_url_keeps_host_drops_token() {
+    assert_eq!(
+        crate::redact::redact_url("https://sub.example/api?token=SECRET"),
+        "https://sub.example/…"
+    );
+    assert_eq!(
+        crate::redact::redact_url("https://user:pass@host.example/x"),
+        "https://host.example/…"
+    );
+    assert_eq!(crate::redact::redact_url("garbage-no-scheme"), "***");
 }

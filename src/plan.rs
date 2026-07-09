@@ -38,8 +38,13 @@ pub fn assess(
     state_dir: &Path,
     ssh_connection: Option<&str>,
 ) -> Assessment {
+    let resolved = crate::subscription::load_resolved(state_dir);
     let artifacts = [
-        ("sing-box", "sing-box.json", render::render_sing_box(cfg)),
+        (
+            "sing-box",
+            "sing-box.json",
+            render::render_sing_box(cfg, resolved.as_ref()),
+        ),
         ("nftables", "nft.rules", render::render_nft(cfg)),
     ];
     let current_dir = state_dir.join("current");
@@ -68,11 +73,13 @@ pub fn assess(
             message: w.message.clone(),
         })
         .collect();
-    risks.push(Risk {
-        level: "warning",
-        code: "OUTBOUND_UNRESOLVED",
-        message: "vpn outbound is a placeholder (spike 0 does not resolve subscriptions); the rendered sing-box config is not connectable".to_string(),
-    });
+    if resolved.is_none() {
+        risks.push(Risk {
+            level: "warning",
+            code: "OUTBOUND_UNRESOLVED",
+            message: "vpn outbound is a placeholder; run resolve-subscription so the rendered sing-box config is connectable".to_string(),
+        });
+    }
     if let Some(message) = ssh_risk(cfg, ssh_connection) {
         risks.push(Risk {
             level: "warning",

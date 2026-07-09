@@ -99,7 +99,8 @@ pub fn config_in_sync(cfg: &GatewayConfig, state_dir: &Path) -> Option<bool> {
     let current = state_dir.join("current");
     let sb = std::fs::read_to_string(current.join("sing-box.json")).ok()?;
     let nft = std::fs::read_to_string(current.join("nft.rules")).ok()?;
-    Some(sb == render::render_sing_box(cfg) && nft == render::render_nft(cfg))
+    let resolved = crate::subscription::load_resolved(state_dir);
+    Some(sb == render::render_sing_box(cfg, resolved.as_ref()) && nft == render::render_nft(cfg))
 }
 
 /// nft probe: (binary_found, table_present, error). `table_present` is None
@@ -138,11 +139,16 @@ pub fn cmd_status(cfg: Option<&GatewayConfig>, state_dir: &Path) -> Result<Strin
         (false, None, Some("unsupported platform".to_string()))
     };
     let interfaces = detect_interfaces().ok();
+    let resolved = crate::subscription::load_resolved(state_dir);
     Ok(ok_envelope(json!({
         "artifacts": {
             "current": current,
             "last_good": last_good,
             "config_in_sync": in_sync,
+        },
+        "subscription": {
+            "configured": cfg.map(|c| c.subscription.is_some()),
+            "outbound_resolved": resolved.is_some(),
         },
         "nftables": {
             "binary_found": nft_bin,
@@ -150,7 +156,6 @@ pub fn cmd_status(cfg: Option<&GatewayConfig>, state_dir: &Path) -> Result<Strin
             "error": nft_err,
         },
         "interfaces": interfaces,
-        "sing_box_service": "not-managed-yet",
     })))
 }
 
@@ -213,6 +218,17 @@ pub fn pure_doctor_checks(
             "no rollback point yet (apply has never replaced artifacts)",
         )
     });
+    if cfg.subscription.is_some() {
+        checks.push(if crate::subscription::load_resolved(state_dir).is_some() {
+            check("subscription", "ok", "outbound resolved from subscription")
+        } else {
+            check(
+                "subscription",
+                "warning",
+                "subscription configured but not resolved — run resolve-subscription (vpn outbound is a placeholder)",
+            )
+        });
+    }
     checks
 }
 

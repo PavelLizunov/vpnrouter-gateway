@@ -1,12 +1,13 @@
 //! apply / rollback: the only mutating commands. Safety order is the contract:
-//!   1. candidate nft rules validated (`nft -c -f`) BEFORE any state changes;
+//!   1. candidate nft rules AND sing-box config validated BEFORE any change;
 //!   2. current artifacts backed up to last-good BEFORE being replaced;
 //!   3. kernel load failure restores artifacts and reloads the previous rules.
 //!
 //! Apply converges: it always (re)loads its nft table even when artifacts are
-//! unchanged, so a reboot-wiped table is repaired by a plain re-apply.
-//! sing-box service management is deliberately absent until the vpn outbound
-//! is real (resolve-subscription, v1).
+//! unchanged, so a reboot-wiped table is repaired by a plain re-apply. The
+//! sing-box service is restarted best-effort and reported — no health-probe
+//! loop or failover (that lesson from the desktop HealthMonitor stays deferred
+//! to a future daemon).
 
 use std::path::Path;
 
@@ -14,14 +15,74 @@ use serde_json::json;
 
 use crate::config::{Finding, GatewayConfig};
 use crate::error::{ok_envelope, CliError, Detail, Suggestion};
-use crate::plan;
-use crate::render;
+use crate::{plan, render, subscription};
 
 const ARTIFACTS: [&str; 2] = ["sing-box.json", "nft.rules"];
+const SING_BOX_UNIT: &str = "vpnrouter-sing-box";
 
 pub struct Opts {
     pub confirmed: bool,
     pub allow_ssh_risk: bool,
+}
+
+/// sing-box config validation outcome. A present-but-rejecting binary is a
+/// hard gate (catches the reality short_id panic class); an absent binary is
+/// a reported skip (render is unit-tested; owner may run sing-box elsewhere).
+pub enum SingBoxCheck {
+    Ok,
+    Rejected(String),
+    Unavailable(String),
+}
+
+pub enum RestartOutcome {
+    Restarted,
+    NotManaged(String),
+    Failed(String),
+}
+
+/// Data-plane seam (sing-box binary + its service); tests replace it.
+pub trait DataPlane {
+    fn check_config(&mut self, config: &Path) -> SingBoxCheck;
+    fn restart(&mut self) -> RestartOutcome;
+}
+
+pub struct RealDataPlane;
+
+impl DataPlane for RealDataPlane {
+    fn check_config(&mut self, config: &Path) -> SingBoxCheck {
+        match std::process::Command::new("sing-box")
+            .arg("check")
+            .arg("-c")
+            .arg(config)
+            .output()
+        {
+            Err(e) => SingBoxCheck::Unavailable(format!("sing-box not runnable: {e}")),
+            Ok(o) if o.status.success() => SingBoxCheck::Ok,
+            Ok(o) => SingBoxCheck::Rejected(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        }
+    }
+
+    fn restart(&mut self) -> RestartOutcome {
+        match std::process::Command::new("systemctl")
+            .args(["restart", SING_BOX_UNIT])
+            .output()
+        {
+            Err(e) => RestartOutcome::NotManaged(format!("systemctl not runnable: {e}")),
+            Ok(o) if o.status.success() => RestartOutcome::Restarted,
+            Ok(o) => {
+                let msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                // Unit simply not installed yet is "not managed", not a failure.
+                if msg.contains("not found")
+                    || msg.contains("not-found")
+                    || msg.contains("No such file")
+                {
+                    RestartOutcome::NotManaged(format!("unit {SING_BOX_UNIT} not installed"))
+                } else {
+                    RestartOutcome::Failed(msg)
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -64,6 +125,7 @@ fn run_nft(args: &[&str], rules: &Path) -> Result<(), NftError> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     cfg: &GatewayConfig,
     warnings: &[Finding],
@@ -72,6 +134,7 @@ pub fn run(
     ssh_connection: Option<&str>,
     opts: Opts,
     nft: &mut dyn NftExec,
+    dp: &mut dyn DataPlane,
 ) -> Result<String, CliError> {
     if !opts.confirmed {
         return Err(confirm_required("apply"));
@@ -94,18 +157,46 @@ pub fn run(
         }
     }
 
-    let rendered_sing_box = render::render_sing_box(cfg);
+    let resolved = subscription::load_resolved(state_dir);
+    let rendered_sing_box = render::render_sing_box(cfg, resolved.as_ref());
     let rendered_nft = render::render_nft(cfg);
     let current = state_dir.join("current");
     let last_good = state_dir.join("last-good");
     std::fs::create_dir_all(&current).map_err(io_err(&current))?;
 
-    // 1. Validate the candidate transaction before touching any state.
-    let candidate = state_dir.join("candidate.nft.rules");
-    std::fs::write(&candidate, &rendered_nft).map_err(io_err(&candidate))?;
-    let checked = nft.check(&candidate);
-    let _ = std::fs::remove_file(&candidate);
-    checked.map_err(|e| nft_err("NFT_CHECK_FAILED", e))?;
+    // 1. Validate BOTH candidates before touching any state.
+    let cand_nft = state_dir.join("candidate.nft.rules");
+    std::fs::write(&cand_nft, &rendered_nft).map_err(io_err(&cand_nft))?;
+    let nft_checked = nft.check(&cand_nft);
+    let cand_sb = state_dir.join("candidate.sing-box.json");
+    std::fs::write(&cand_sb, &rendered_sing_box).map_err(io_err(&cand_sb))?;
+    let sb_checked = dp.check_config(&cand_sb);
+    let _ = std::fs::remove_file(&cand_nft);
+    let _ = std::fs::remove_file(&cand_sb);
+    nft_checked.map_err(|e| nft_err("NFT_CHECK_FAILED", e))?;
+    let mut notes: Vec<String> = Vec::new();
+    match sb_checked {
+        SingBoxCheck::Ok => {}
+        SingBoxCheck::Rejected(stderr) => {
+            return Err(CliError {
+                exit: 4,
+                code: "SINGBOX_CHECK_FAILED",
+                message: "sing-box rejected the rendered config; nothing was changed".to_string(),
+                details: vec![Detail {
+                    code: "SINGBOX_STDERR".to_string(),
+                    message: stderr,
+                }],
+                suggestions: Vec::new(),
+                safe_to_retry: true,
+            });
+        }
+        SingBoxCheck::Unavailable(why) => {
+            notes.push(format!("sing-box config not validated: {why}"));
+        }
+    }
+    if resolved.is_none() {
+        notes.push("vpn outbound is a placeholder; run resolve-subscription".to_string());
+    }
 
     // 2. Backup current artifacts before replacing them.
     let file_change = !assessment.changes.is_empty();
@@ -145,13 +236,23 @@ pub fn run(
         return Err(err);
     }
 
+    // 5. Best-effort data-plane restart (reported, never rolls back nft).
+    let (service, service_detail) = match dp.restart() {
+        RestartOutcome::Restarted => ("restarted", None),
+        RestartOutcome::NotManaged(why) => ("not-managed", Some(why)),
+        RestartOutcome::Failed(why) => ("restart-failed", Some(why)),
+    };
+
     Ok(ok_envelope(json!({
         "config_path": config_path.display().to_string(),
         "changes": assessment.changes,
         "risks": assessment.risks,
         "backed_up": backed_up,
         "nft_loaded": true,
-        "sing_box_service": "not-managed-yet",
+        "outbound_resolved": resolved.is_some(),
+        "sing_box_service": service,
+        "sing_box_service_detail": service_detail,
+        "notes": notes,
     })))
 }
 

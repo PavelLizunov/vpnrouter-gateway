@@ -558,5 +558,51 @@ musl-дистрибутивах без зависимостей.
 review-agent) сознательно не разворачивался: одиночный локальный проект,
 hook покрывает принудительное ядро методологии.
 
-Осталось из v1: `resolve-subscription` + реальный outbound + redaction +
-systemd unit для sing-box.
+## 16. resolve-subscription + реальный outbound + redaction + sing-box gate (2026-07-09)
+
+Последний функциональный кусок v1 — шлюз стал реально подключаемым.
+
+- **`resolve-subscription`** ([subscription.rs](../src/subscription.rs)):
+  fetch (`ureq` 3, rustls-TLS) либо `--file` для офлайна → parse → выбор
+  `active` → кэш `/var/lib/vpnrouter/subscription.json`. Парсер чистый
+  (fixture-тестируемый), сеть — тонкий seam `Fetcher`. Форматы: base64/plain
+  список `vless://` (свой tolerant base64-декодер, без новой зависимости) +
+  passthrough готового sing-box JSON (лифт `outbounds`, отсев direct/
+  selector/urltest). hysteria2/tuic/ss/vmess/trojan **отложены** (ponytail:
+  `parse_uri` возвращает Unsupported, добавить когда реальная подписка
+  принесёт). vless-парсер строит 1.13-outbound: reality (pbk/sid/utls),
+  tls (sni/alpn/fp), flow, packet_encoding=xudp, транспорты ws/grpc/http.
+- **Реальный outbound в render**: `render_sing_box(cfg, resolved)` — при
+  наличии кэша ретегирует резолвнутый outbound в `vpn-out` (route-правила не
+  меняются), иначе placeholder. `OUTBOUND_UNRESOLVED` risk только когда кэша
+  нет. Golden стабилен: тесты рендерят с `None`.
+- **Redaction** ([redact.rs](../src/redact.rs)): модель desktop-редактора —
+  structured, ключи сохранены/значения маскированы, секретный ключ маскирует
+  и **числовое** значение (фикс дыры desktop). URL → scheme://host, битый
+  URL → `***`. reality public_key публичен и сохраняется. Применяется ко
+  всему выводу `resolve-subscription`; реальные секреты — только на диске
+  (root-only). Полный doctor-бандл — later, но механизм готов.
+- **apply-гейт sing-box**: apply теперь валидирует ОБА кандидата
+  (`nft -c` + `sing-box check`) ДО любых изменений (seam `DataPlane`).
+  Отвергающий sing-box — жёсткий гейт (exit 4 `SINGBOX_CHECK_FAILED`),
+  отсутствующий бинарь — reported skip. Плюс best-effort restart сервиса
+  (`systemctl restart vpnrouter-sing-box`), reported, без health-loop/failover
+  (тот урок HealthMonitor отложен в будущий daemon).
+- systemd-unit + packaging/README.md (деплой, `CAP_NET_ADMIN`, gcompat для
+  musl).
+
+Крейт: `ureq = "3"` (rustls default). Следствие: `ring` требует C-тулчейн;
+кросс-musl с Windows больше не собирается без `x86_64-linux-musl-gcc` —
+Linux-бинарь теперь собирается **нативно** (доказано в CT: cargo 1.97 + gcc).
+
+Валидация: 42 юнит-теста (base64 вектора, vless-reality парсинг, JSON
+passthrough, select, redaction, render-with-resolved, sing-box-check гейт).
+Нативная сборка + все тесты в Debian 12 CT. E2E из 8 шагов (реальный
+vless-fixture → resolve → plan → apply → рендер реального outbound →
+**настоящий `sing-box check` принял конфиг** → status/doctor → **живой
+ureq-TLS фетч публичного HTTPS**), плюс негативный тест: битый reality
+short_id → apply отказал (exit 4), рабочий `current/` не тронут — доказано,
+что плохой резолв подписки не брикает шлюз.
+
+Осталось (later, не v1-блокеры): hysteria2/tuic/ss URI, pinned_outbound/
+failover, полный doctor redaction-бандл, daemon/watchdog, systemd-мониторинг.

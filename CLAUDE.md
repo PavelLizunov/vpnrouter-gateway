@@ -13,9 +13,9 @@ live-валидация: [docs/gateway-architecture.md](docs/gateway-architectur
   прогон должен быть зелёным).
 - `cargo clippy --all-targets -- -D warnings` и `cargo fmt --check` — обязаны
   быть чистыми.
-- Linux-бинарь с Windows: `cargo build --release --target
-  x86_64-unknown-linux-musl` (rust-lld, см. `.cargo/config.toml`) — статический,
-  работает на glibc и musl.
+- Linux-бинарь: собирать **нативно на Linux** (`cargo build --release`, нужен
+  gcc — ureq тянет ring/TLS). Кросс-musl с Windows требует
+  `x86_64-linux-musl-gcc`; нативная сборка — boring-путь. См. packaging/README.md.
 - Живая лаборатория: Proxmox LXC (доступ и IP — в памяти проекта;
   `livetest.sh` — 8-шаговый сценарий apply/rollback в контейнере).
 

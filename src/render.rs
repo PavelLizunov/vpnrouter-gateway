@@ -7,11 +7,33 @@ use serde_json::{json, Map, Value};
 
 use crate::config::{DnsMode, GatewayConfig, Policy, Route, RoutingMode};
 
-/// ponytail: spike 0 does not resolve subscriptions; the vpn outbound is a
-/// structurally valid placeholder. v1 replaces it via resolve-subscription.
+/// All route rules reference this tag; the actual outbound is either a
+/// placeholder (no subscription resolved) or the resolved one retagged to it.
 pub const PLACEHOLDER_OUTBOUND: &str = "vpn-out";
 
-pub fn render_sing_box(cfg: &GatewayConfig) -> String {
+/// The vpn outbound: resolved subscription outbound retagged to `vpn-out`, or
+/// a structurally valid placeholder when none is resolved yet.
+fn vpn_outbound(resolved: Option<&Value>) -> Value {
+    match resolved {
+        Some(ob) => {
+            let mut ob = ob.clone();
+            if let Some(map) = ob.as_object_mut() {
+                map.insert("tag".to_string(), json!(PLACEHOLDER_OUTBOUND));
+            }
+            ob
+        }
+        None => json!({
+            "type": "vless",
+            "tag": PLACEHOLDER_OUTBOUND,
+            "server": "placeholder.invalid",
+            "server_port": 443,
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "tls": { "enabled": true, "server_name": "placeholder.invalid" }
+        }),
+    }
+}
+
+pub fn render_sing_box(cfg: &GatewayConfig, resolved: Option<&Value>) -> String {
     let mut rules: Vec<Value> = vec![
         json!({ "action": "sniff", "timeout": "300ms" }),
         json!({ "protocol": "dns", "action": "hijack-dns" }),
@@ -84,14 +106,7 @@ pub fn render_sing_box(cfg: &GatewayConfig) -> String {
         },
         "inbounds": [inbound],
         "outbounds": [
-            {
-                "type": "vless",
-                "tag": PLACEHOLDER_OUTBOUND,
-                "server": "placeholder.invalid",
-                "server_port": 443,
-                "uuid": "00000000-0000-0000-0000-000000000000",
-                "tls": { "enabled": true, "server_name": "placeholder.invalid" }
-            },
+            vpn_outbound(resolved),
             { "type": "direct", "tag": "direct" }
         ],
         "route": {

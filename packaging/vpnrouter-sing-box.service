@@ -1,0 +1,18 @@
+[Unit]
+Description=vpnrouter-gateway sing-box data plane
+Documentation=https://sing-box.sagernet.org
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sing-box run -c /var/lib/vpnrouter/current/sing-box.json
+Restart=on-failure
+RestartSec=3
+# sing-box builds the tun and routes; it needs net admin, not full root.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

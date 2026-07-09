@@ -7,8 +7,10 @@ mod apply;
 mod config;
 mod error;
 mod plan;
+mod redact;
 mod render;
 mod status;
+mod subscription;
 #[cfg(test)]
 mod tests;
 
@@ -17,9 +19,10 @@ use std::path::{Path, PathBuf};
 use error::{ok_envelope, CliError, Detail, Suggestion};
 use lexopt::prelude::*;
 use serde_json::json;
+use subscription::Fetcher as _;
 
 const SCHEMA: &str = include_str!("../schema/gateway.schema.json");
-const USAGE: &str = "usage: vpnrouter-gateway <schema|check|plan|apply|rollback|status|doctor|explain|detect-interfaces> [--config PATH] [--state-dir DIR] [--yes] [--allow-ssh-risk] [--source IP] [--dest IP] [--proto tcp|udp] [--port N] [--json]";
+const USAGE: &str = "usage: vpnrouter-gateway <schema|check|plan|apply|rollback|status|doctor|explain|resolve-subscription|detect-interfaces> [--config PATH] [--state-dir DIR] [--yes] [--allow-ssh-risk] [--source IP] [--dest IP] [--proto tcp|udp] [--port N] [--url URL] [--file PATH] [--json]";
 
 fn main() {
     let (out, code) = match run() {
@@ -47,6 +50,8 @@ fn run() -> Result<String, CliError> {
     let mut dest: Option<String> = None;
     let mut proto: Option<String> = None;
     let mut port: Option<String> = None;
+    let mut url: Option<String> = None;
+    let mut file: Option<PathBuf> = None;
     while let Some(arg) = parser.next().map_err(|e| usage(&e.to_string()))? {
         let val = |parser: &mut lexopt::Parser| -> Result<String, CliError> {
             parser
@@ -64,6 +69,8 @@ fn run() -> Result<String, CliError> {
             Long("dest") => dest = Some(val(&mut parser)?),
             Long("proto") => proto = Some(val(&mut parser)?),
             Long("port") => port = Some(val(&mut parser)?),
+            Long("url") => url = Some(val(&mut parser)?),
+            Long("file") => file = Some(PathBuf::from(val(&mut parser)?)),
             // JSON is the only output format for now; accepted for forward compatibility.
             Long("json") => {}
             other => return Err(usage(&format!("unexpected argument {other:?}; {USAGE}"))),
@@ -79,11 +86,75 @@ fn run() -> Result<String, CliError> {
         "status" => cmd_status(config_path, &state_dir),
         "doctor" => cmd_doctor(&need_config(config_path)?, &state_dir),
         "explain" => cmd_explain(&need_config(config_path)?, source, dest, proto, port),
+        "resolve-subscription" => cmd_resolve(config_path, &state_dir, url, file.as_deref()),
         "detect-interfaces" => Ok(ok_envelope(
             json!({ "interfaces": status::detect_interfaces()? }),
         )),
         other => Err(usage(&format!("unknown command \"{other}\"; {USAGE}"))),
     }
+}
+
+fn cmd_resolve(
+    config_path: Option<PathBuf>,
+    state_dir: &Path,
+    url_flag: Option<String>,
+    file: Option<&Path>,
+) -> Result<String, CliError> {
+    // active/url come from --url/--config; --file supplies an offline body.
+    let sub = match &config_path {
+        Some(p) => config::load(p)?.subscription,
+        None => None,
+    };
+    let url = url_flag
+        .or_else(|| sub.as_ref().map(|s| s.url.clone()))
+        .ok_or_else(|| {
+            usage("resolve-subscription needs --url or a [subscription] url in --config")
+        })?;
+    let active = sub.as_ref().map(|s| s.active.clone());
+
+    let body = match file {
+        Some(f) => std::fs::read_to_string(f)
+            .map_err(|e| CliError::env("FILE_READ_FAILED", format!("{}: {e}", f.display())))?,
+        None => subscription::RealFetcher
+            .get(&url)
+            .map_err(|e| CliError::env("SUBSCRIPTION_FETCH_FAILED", e))?,
+    };
+    let outbounds = subscription::parse_subscription(&body).map_err(|e| CliError {
+        exit: 1,
+        code: "SUBSCRIPTION_PARSE_FAILED",
+        message: e.0,
+        details: Vec::new(),
+        suggestions: Vec::new(),
+        safe_to_retry: false,
+    })?;
+    let available: Vec<&str> = outbounds.iter().map(|o| o.name.as_str()).collect();
+
+    // Without an active name we can only list what's on offer.
+    let Some(active) = active else {
+        return Ok(ok_envelope(json!({
+            "source": redact::redact_url(&url),
+            "available": available,
+            "resolved": false,
+            "hint": "set [subscription].active (or it will be selectable via --active later) to pick one",
+        })));
+    };
+    let chosen = subscription::select(&outbounds, &active).map_err(|e| CliError {
+        exit: 1,
+        code: "ACTIVE_OUTBOUND_NOT_FOUND",
+        message: e.0,
+        details: Vec::new(),
+        suggestions: Vec::new(),
+        safe_to_retry: false,
+    })?;
+    subscription::save_cache(state_dir, &url, chosen)
+        .map_err(|e| CliError::env("CACHE_WRITE_FAILED", e.to_string()))?;
+    Ok(ok_envelope(json!({
+        "source": redact::redact_url(&url),
+        "active": chosen.name,
+        "available": available,
+        "resolved": true,
+        "outbound": redact::redact_value(&chosen.outbound),
+    })))
 }
 
 fn cmd_status(config_path: Option<PathBuf>, state_dir: &Path) -> Result<String, CliError> {
@@ -172,6 +243,7 @@ fn cmd_apply(
             allow_ssh_risk,
         },
         &mut apply::RealNft,
+        &mut apply::RealDataPlane,
     )
 }
 

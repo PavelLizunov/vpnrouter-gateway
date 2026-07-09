@@ -28,6 +28,15 @@
         }
       }
     },
+    "subscription": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url", "active"],
+      "properties": {
+        "url": { "type": "string", "description": "Subscription URL (secret: embeds a token, redacted in output). Resolve with `resolve-subscription`." },
+        "active": { "type": "string", "description": "Name of the outbound to select (matches share-link fragment / sing-box outbound tag)" }
+      }
+    },
     "routing": {
       "type": "object",
       "additionalProperties": false,

@@ -12,6 +12,12 @@ lan_cidr = "192.168.10.0/24"
 # from tun routing so SSH survives a dead tunnel and a bad apply.
 sources = ["192.168.10.50/32"]
 
+[subscription]
+# The URL is a secret (embeds a token) — redacted in all output.
+# Fetch/select with: vpnrouter-gateway resolve-subscription --config <this>
+url = "https://example.com/sub"
+active = "Germany VLESS"
+
 [routing]
 mode = "full" # full | split
 

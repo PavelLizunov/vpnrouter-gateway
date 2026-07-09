@@ -14,6 +14,8 @@ pub struct GatewayConfig {
     pub interfaces: Interfaces,
     #[serde(default)]
     pub management: Management,
+    #[serde(default)]
+    pub subscription: Option<Subscription>,
     pub routing: Routing,
     #[serde(default)]
     pub tun: Tun,
@@ -23,6 +25,17 @@ pub struct GatewayConfig {
     pub dns: Dns,
     #[serde(default)]
     pub killswitch: Killswitch,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Subscription {
+    /// Subscription URL. The URL is itself a secret (embeds an access token);
+    /// never log it verbatim — see redact::redact_url.
+    pub url: String,
+    /// Name of the outbound to select from the subscription (matches the
+    /// share-link fragment / sing-box outbound tag).
+    pub active: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -286,8 +299,29 @@ pub fn validate(cfg: &GatewayConfig) -> (Vec<Finding>, Vec<Finding>) {
         ));
     }
 
+    if let Some(sub) = &cfg.subscription {
+        if !(sub.url.starts_with("http://") || sub.url.starts_with("https://")) {
+            errors.push(Finding::new(
+                "SUBSCRIPTION_URL_INVALID",
+                "subscription.url must start with http:// or https://".to_string(),
+            ));
+        }
+        if sub.active.trim().is_empty() {
+            errors.push(Finding::new(
+                "SUBSCRIPTION_ACTIVE_EMPTY",
+                "subscription.active must name the outbound to select".to_string(),
+            ));
+        }
+    }
+
     let has_vpn_traffic =
         cfg.routing.mode == RoutingMode::Full || cfg.policies.iter().any(|p| p.route == Route::Vpn);
+    if has_vpn_traffic && cfg.subscription.is_none() {
+        warnings.push(Finding::new(
+            "SUBSCRIPTION_MISSING",
+            "vpn routing is configured but no [subscription]; the vpn outbound stays a placeholder until one is added and resolved".to_string(),
+        ));
+    }
     if cfg.killswitch.enabled && !has_vpn_traffic {
         errors.push(Finding::new(
             "KILLSWITCH_WITHOUT_VPN_POLICY",
