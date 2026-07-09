@@ -1,0 +1,2 @@
+# LF everywhere: golden files are byte-compared, sh scripts break on CRLF.
+* text=auto eol=lf

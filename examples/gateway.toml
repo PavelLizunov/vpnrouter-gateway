@@ -1,0 +1,38 @@
+# Sample gateway.toml for vpnrouter-gateway spike 0.
+#   check: vpnrouter-gateway check --config examples/gateway.toml --json
+#   plan:  vpnrouter-gateway plan  --config examples/gateway.toml --json
+
+[interfaces]
+wan = "eth0"
+lan = "br0"
+lan_cidr = "192.168.10.0/24"
+
+[management]
+# Admin hosts: always routed direct, exempt from the killswitch, and excluded
+# from tun routing so SSH survives a dead tunnel and a bad apply.
+sources = ["192.168.10.50/32"]
+
+[routing]
+mode = "full" # full | split
+
+[tun]
+mtu = 1420 # 1280..=1500; sing-tun drops IP fragments, >1500 blackholes PMTUD
+
+# Policies are first-match-wins in file order: put specific before broad.
+[[policies]]
+name = "voice-udp"
+source = "192.168.10.0/24"
+protocol = "udp"
+port = 50000
+route = "vpn"
+
+[[policies]]
+name = "office-default"
+source = "192.168.10.0/24"
+route = "vpn"
+
+[dns]
+mode = "tunneled" # tunneled | direct
+
+[killswitch]
+enabled = true
