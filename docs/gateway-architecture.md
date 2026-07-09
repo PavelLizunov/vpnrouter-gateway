@@ -529,5 +529,34 @@ ssh-сессии хоста, и apply отказался применяться,
 кросс-сборка с Windows, 1.4 MB) — один артефакт работает на glibc- и
 musl-дистрибутивах без зависимостей.
 
-Осталось из v1: `status` (in-band probe), `doctor` (+redaction),
-`explain`, `resolve-subscription` + реальный outbound + systemd unit.
+## 15. status / doctor / explain + git-гейт (2026-07-09)
+
+Реализована read-only тройка доверия ([status.rs](../src/status.rs), explain
+в [plan.rs](../src/plan.rs)):
+
+- `status [--config]` — артефакты (current/last-good/config_in_sync-дрейф),
+  nft-таблица (binary/present/error), интерфейсы; host-пробы деградируют
+  честно, команда не падает без root/не на Linux.
+- `doctor --config` — checks-список: config+warnings, artifacts-дрейф,
+  rollback-точка, nft-таблица, `net.ipv4.ip_forward` (читается напрямую из
+  /proc, без shell-out), существование wan/lan интерфейсов. Live-прогон в CT
+  немедленно поймал реальную проблему: `lan interface br0 not found` —
+  ровно тот сигнал, ради которого doctor существует. Redaction-бандл
+  сознательно отложен: в конфиге пока нет секретов; обязателен вместе с
+  `[subscription]`.
+- `explain --source [--dest --proto --port]` — детерминированный matcher,
+  зеркалящий порядок render: management → policies (first-match) →
+  routing.mode; отдаёт verdict + полный trace с причинами несовпадений +
+  notes (killswitch-поведение, placeholder outbound). `--dest` принимается,
+  но не оценивается (нет destination-политик в v1) — прямо сказано в notes.
+
+Инженерный гейт: git-репозиторий (main), блокирующий pre-commit hook
+(fmt --check + clippy -D warnings + cargo test; tracked-копия
+`.githooks-pre-commit.sh`), `.gitattributes` с LF-нормализацией (golden
+сравниваются побайтово, sh-скрипты ломаются на CRLF), проектный CLAUDE.md
+с инвариантами. 33 юнит-теста. Полный /methodology-bootstrap (CI, ADR,
+review-agent) сознательно не разворачивался: одиночный локальный проект,
+hook покрывает принудительное ядро методологии.
+
+Осталось из v1: `resolve-subscription` + реальный outbound + redaction +
+systemd unit для sing-box.
