@@ -30,6 +30,20 @@ pub struct ResolvedOutbound {
     pub outbound: Value,
 }
 
+/// A subscription entry we recognised but can't build yet (unsupported
+/// protocol). Surfaced so a dropped node is never a silent cap.
+#[derive(Debug, Clone)]
+pub struct Skipped {
+    pub name: String,
+    pub scheme: String,
+}
+
+#[derive(Debug, Default)]
+pub struct ParseResult {
+    pub outbounds: Vec<ResolvedOutbound>,
+    pub skipped: Vec<Skipped>,
+}
+
 /// Network seam; the only thing tests replace.
 pub trait Fetcher {
     fn get(&self, url: &str) -> Result<String, String>;
@@ -49,14 +63,30 @@ impl Fetcher for RealFetcher {
 }
 
 /// Parse a subscription body into proxy outbounds. Accepts, in order:
-/// sing-box/JSON (`{...}` with an `outbounds` array), base64 of a URI list, or
-/// a plain newline-separated URI list.
-pub fn parse_subscription(body: &str) -> Result<Vec<ResolvedOutbound>, SubError> {
+/// a JSON wrapper (`{"config":"base64…"}`, e.g. ninitux), sing-box JSON
+/// (`{...}` with an `outbounds` array), base64 of a URI list, or a plain
+/// newline-separated URI list.
+pub fn parse_subscription(body: &str) -> Result<ParseResult, SubError> {
+    parse_body(body, 0)
+}
+
+fn parse_body(body: &str, depth: u8) -> Result<ParseResult, SubError> {
+    if depth > 3 {
+        return Err(SubError::new("subscription nesting too deep"));
+    }
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return Err(SubError::new("empty subscription body"));
     }
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        // Panel wrapper: unwrap a base64/plain body carried in a string field.
+        if let Ok(Value::Object(m)) = serde_json::from_str::<Value>(trimmed) {
+            for key in ["config", "data", "subscription"] {
+                if let Some(inner) = m.get(key).and_then(|v| v.as_str()) {
+                    return parse_body(inner, depth + 1);
+                }
+            }
+        }
         return parse_singbox_json(trimmed);
     }
     // Try base64; use the decoded text only if it looks like a URI list.
@@ -68,7 +98,7 @@ pub fn parse_subscription(body: &str) -> Result<Vec<ResolvedOutbound>, SubError>
         None => trimmed.to_string(),
     };
     let mut out = Vec::new();
-    let mut unsupported = 0;
+    let mut skipped = Vec::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -76,19 +106,33 @@ pub fn parse_subscription(body: &str) -> Result<Vec<ResolvedOutbound>, SubError>
         }
         match parse_uri(line) {
             Ok(Some(r)) => out.push(r),
-            Ok(None) => unsupported += 1,
-            Err(_) => unsupported += 1,
+            Ok(None) => skipped.push(skipped_entry(line)),
+            Err(_) => skipped.push(skipped_entry(line)),
         }
     }
     if out.is_empty() {
         return Err(SubError::new(format!(
-            "no supported outbounds found ({unsupported} unsupported/unparseable entries; spike supports vless:// and sing-box JSON)"
+            "no supported outbounds found ({} unsupported/unparseable entries; supports vless:// and sing-box JSON)",
+            skipped.len()
         )));
     }
-    Ok(out)
+    Ok(ParseResult {
+        outbounds: out,
+        skipped,
+    })
 }
 
-fn parse_singbox_json(text: &str) -> Result<Vec<ResolvedOutbound>, SubError> {
+/// Best-effort (name, scheme) for an entry we can't build.
+fn skipped_entry(uri: &str) -> Skipped {
+    let scheme = uri.split_once("://").map_or("?", |(s, _)| s).to_string();
+    let name = uri
+        .rsplit_once('#')
+        .map(|(_, f)| percent_decode(f))
+        .unwrap_or_default();
+    Skipped { name, scheme }
+}
+
+fn parse_singbox_json(text: &str) -> Result<ParseResult, SubError> {
     let v: Value =
         serde_json::from_str(text).map_err(|e| SubError::new(format!("invalid JSON: {e}")))?;
     // Accept either a full config ({"outbounds":[...]}) or a bare array.
@@ -116,7 +160,10 @@ fn parse_singbox_json(text: &str) -> Result<Vec<ResolvedOutbound>, SubError> {
     if out.is_empty() {
         return Err(SubError::new("sing-box JSON has no proxy outbounds"));
     }
-    Ok(out)
+    Ok(ParseResult {
+        outbounds: out,
+        skipped: Vec::new(),
+    })
 }
 
 /// Ok(Some) = parsed; Ok(None) = recognised but unsupported scheme.

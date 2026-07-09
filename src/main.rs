@@ -119,7 +119,7 @@ fn cmd_resolve(
             .get(&url)
             .map_err(|e| CliError::env("SUBSCRIPTION_FETCH_FAILED", e))?,
     };
-    let outbounds = subscription::parse_subscription(&body).map_err(|e| CliError {
+    let parsed = subscription::parse_subscription(&body).map_err(|e| CliError {
         exit: 1,
         code: "SUBSCRIPTION_PARSE_FAILED",
         message: e.0,
@@ -127,18 +127,25 @@ fn cmd_resolve(
         suggestions: Vec::new(),
         safe_to_retry: false,
     })?;
-    let available: Vec<&str> = outbounds.iter().map(|o| o.name.as_str()).collect();
+    let available: Vec<&str> = parsed.outbounds.iter().map(|o| o.name.as_str()).collect();
+    // Never a silent cap: name every node we recognised but can't build yet.
+    let skipped: Vec<serde_json::Value> = parsed
+        .skipped
+        .iter()
+        .map(|s| json!({ "name": s.name, "protocol": s.scheme }))
+        .collect();
 
     // Without an active name we can only list what's on offer.
     let Some(active) = active else {
         return Ok(ok_envelope(json!({
             "source": redact::redact_url(&url),
             "available": available,
+            "skipped_unsupported": skipped,
             "resolved": false,
-            "hint": "set [subscription].active (or it will be selectable via --active later) to pick one",
+            "hint": "set [subscription].active to the exact name of an available outbound to pick one",
         })));
     };
-    let chosen = subscription::select(&outbounds, &active).map_err(|e| CliError {
+    let chosen = subscription::select(&parsed.outbounds, &active).map_err(|e| CliError {
         exit: 1,
         code: "ACTIVE_OUTBOUND_NOT_FOUND",
         message: e.0,
@@ -152,6 +159,7 @@ fn cmd_resolve(
         "source": redact::redact_url(&url),
         "active": chosen.name,
         "available": available,
+        "skipped_unsupported": skipped,
         "resolved": true,
         "outbound": redact::redact_value(&chosen.outbound),
     })))

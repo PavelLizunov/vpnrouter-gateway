@@ -773,7 +773,7 @@ fn base64_decode_standard_and_urlsafe() {
 
 #[test]
 fn parse_vless_reality_share_link() {
-    let obs = parse_subscription(VLESS_REALITY).unwrap();
+    let obs = parse_subscription(VLESS_REALITY).unwrap().outbounds;
     assert_eq!(obs.len(), 1);
     let o = &obs[0];
     assert_eq!(o.name, "Germany VLESS");
@@ -796,7 +796,7 @@ fn parse_base64_wrapped_list_and_select() {
     let list = format!(
         "{VLESS_REALITY}\nvless://22222222-2222-2222-2222-222222222222@b.example:8443?security=tls&sni=b.example#Backup"
     );
-    let obs = parse_subscription(&b64(&list)).unwrap();
+    let obs = parse_subscription(&b64(&list)).unwrap().outbounds;
     assert_eq!(obs.len(), 2);
     assert_eq!(select(&obs, "Germany VLESS").unwrap().name, "Germany VLESS");
     assert_eq!(
@@ -808,13 +808,26 @@ fn parse_base64_wrapped_list_and_select() {
 }
 
 #[test]
+fn parse_json_wrapper_ninitux_shape() {
+    // ninitux returns {"status":"ok","config":"<base64 of a vless list>"}
+    let wrapped = format!(
+        r#"{{"status":"ok","app":"vpn-router","config":"{}"}}"#,
+        b64(VLESS_REALITY)
+    );
+    let obs = parse_subscription(&wrapped).unwrap().outbounds;
+    assert_eq!(obs.len(), 1);
+    assert_eq!(obs[0].name, "Germany VLESS");
+    assert_eq!(obs[0].outbound["server"], "server.example");
+}
+
+#[test]
 fn parse_singbox_json_passthrough() {
     let json = r#"{"outbounds":[
         {"type":"vless","tag":"JP","server":"jp.example","server_port":443,"uuid":"u"},
         {"type":"direct","tag":"direct"},
         {"type":"selector","tag":"select","outbounds":["JP"]}
     ]}"#;
-    let obs = parse_subscription(json).unwrap();
+    let obs = parse_subscription(json).unwrap().outbounds;
     assert_eq!(obs.len(), 1, "only proxy outbounds, not direct/selector");
     assert_eq!(obs[0].name, "JP");
 }
@@ -826,9 +839,25 @@ fn parse_unsupported_only_errors() {
 }
 
 #[test]
+fn skipped_unsupported_nodes_are_named() {
+    // vless supported, hysteria2/naive skipped but surfaced (no silent cap).
+    let list = format!(
+        "{VLESS_REALITY}\nhysteria2://p@h:443#Latvia%20HY2\nnaive+https://x@h:443#LV%20NAIVE"
+    );
+    let r = parse_subscription(&list).unwrap();
+    assert_eq!(r.outbounds.len(), 1);
+    assert_eq!(r.skipped.len(), 2);
+    assert!(r
+        .skipped
+        .iter()
+        .any(|s| s.scheme == "hysteria2" && s.name == "Latvia HY2"));
+    assert!(r.skipped.iter().any(|s| s.scheme == "naive+https"));
+}
+
+#[test]
 fn resolve_cache_roundtrip_and_render() {
     let d = tmpdir("resolve");
-    let obs = parse_subscription(VLESS_REALITY).unwrap();
+    let obs = parse_subscription(VLESS_REALITY).unwrap().outbounds;
     let chosen = select(&obs, "Germany VLESS").unwrap();
     subscription::save_cache(&d, "https://sub.example/token123", chosen).unwrap();
     let resolved = subscription::load_resolved(&d).expect("cache loads");
