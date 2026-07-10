@@ -51,15 +51,30 @@ pub trait Fetcher {
 
 pub struct RealFetcher;
 
+/// A hung subscription server must not hang the CLI (review finding F1).
+const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 impl Fetcher for RealFetcher {
     fn get(&self, url: &str) -> Result<String, String> {
-        ureq::get(url)
-            .call()
-            .map_err(|e| format!("fetch failed: {e}"))?
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| format!("reading response body failed: {e}"))
+        fetch_with_timeout(url, FETCH_TIMEOUT)
     }
+}
+
+pub(crate) fn fetch_with_timeout(
+    url: &str,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .build()
+        .into();
+    agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("fetch failed: {e}"))?
+        .body_mut()
+        .read_to_string()
+        .map_err(|e| format!("reading response body failed: {e}"))
 }
 
 /// Parse a subscription body into proxy outbounds. Accepts, in order:
@@ -204,7 +219,7 @@ fn parse_vless(uri: &str) -> Result<ResolvedOutbound, SubError> {
     } else {
         fragment
     };
-    ob.insert("tag".into(), json!(name));
+    ob.insert("tag".into(), json!(name.clone()));
     ob.insert("server".into(), json!(host));
     ob.insert("server_port".into(), json!(port));
     ob.insert("uuid".into(), json!(uuid));
@@ -252,7 +267,7 @@ fn parse_vless(uri: &str) -> Result<ResolvedOutbound, SubError> {
     }
 
     Ok(ResolvedOutbound {
-        name: ob["tag"].as_str().unwrap().to_string(),
+        name,
         outbound: Value::Object(ob),
     })
 }

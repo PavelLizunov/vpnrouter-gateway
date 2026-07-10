@@ -29,8 +29,8 @@ cargo deny check licenses bans sources               # лицензии/дубл
 
 | # | Приоритет | Файл | Находка |
 | --- | --- | --- | --- |
-| F1 | **P1 корректность** | [subscription.rs](../src/subscription.rs) `RealFetcher::get` | Фетч подписки **без таймаута** — зависший сервер блокирует `resolve-subscription` навсегда. Фикс: `ureq::Agent` с `timeout_global`/`timeout_connect` (~15s), как было заявлено в доке. Проверить API ureq 3.3 (Agent config builder). |
-| F2 | P3 стиль | [subscription.rs:255](../src/subscription.rs) | `ob["tag"].as_str().unwrap()` — безопасен (tag выставлен строкой выше), но reviewer флагнёт: заменить на локальную `name` без индексации/unwrap. |
+| F1 | ~~P1~~ **FIXED** | [subscription.rs](../src/subscription.rs) `fetch_with_timeout` | Был фетч без таймаута. Закрыто: `ureq::Agent` + `timeout_global` 15s; тест `fetch_times_out_on_silent_server` (молчащий listener → ошибка за ~1s). |
+| F2 | ~~P3~~ **FIXED** | [subscription.rs](../src/subscription.rs) `parse_vless` | Был `ob["tag"].as_str().unwrap()`. Закрыто: `name.clone()` при вставке tag, поле `name` без unwrap. |
 | F3 | инфо | Cargo/serde_json | Детерминизм render **подтверждён**: serde_json без `preserve_order` → `Value` = сортированный BTreeMap; `indexmap` в графе сборки отсутствует; закреплено golden-тестом. Не regression-риск, но задокументировать зависимость инварианта от фичи. |
 | F4 | P3 | весь src | 47 `clippy::pedantic` подсказок. Не фиксить слепо; триажить (напр. `must_use`, `#[allow]` на осознанных местах). |
 

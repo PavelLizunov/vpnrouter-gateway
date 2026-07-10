@@ -894,6 +894,26 @@ fn redact_masks_secrets_keeps_diagnostics() {
 }
 
 #[test]
+fn fetch_times_out_on_silent_server() {
+    // Bound listener that never accepts/responds: connect succeeds via the
+    // kernel backlog, then the server stays silent -> global timeout fires.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let start = std::time::Instant::now();
+    let res = subscription::fetch_with_timeout(
+        &format!("http://{addr}/sub"),
+        std::time::Duration::from_secs(1),
+    );
+    assert!(res.is_err(), "silent server must yield an error, got Ok");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "timed out too slowly: {:?}",
+        start.elapsed()
+    );
+    drop(listener);
+}
+
+#[test]
 fn redact_url_keeps_host_drops_token() {
     assert_eq!(
         crate::redact::redact_url("https://sub.example/api?token=SECRET"),
