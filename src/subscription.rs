@@ -4,9 +4,9 @@
 //! world is messy — accept base64/plain/JSON, never panic on a bad line, drop
 //! what we can't parse and count it.
 //!
-//! Scope (ponytail): vless:// share links (the doc's primary, Reality) and
-//! sing-box JSON passthrough. hysteria2/tuic/ss share links are deferred until
-//! a real subscription needs them — parse_uri returns Unsupported for now.
+//! Scope: vless:// (Reality/TLS, ws/grpc/http transports), hysteria2:// (QUIC),
+//! and sing-box JSON passthrough. tuic/ss/vmess/trojan/naive are surfaced as
+//! skipped-with-reason until a real subscription needs them.
 
 use std::path::Path;
 
@@ -245,10 +245,81 @@ fn parse_uri(uri: &str) -> Result<Option<ResolvedOutbound>, SubError> {
         .ok_or_else(|| SubError::new("no scheme"))?;
     match scheme {
         "vless" => parse_vless(uri).map(Some),
+        "hysteria2" | "hy2" => parse_hysteria2(uri).map(Some),
         // ponytail: add when a real subscription carries them.
-        "hysteria2" | "hy2" | "tuic" | "ss" | "vmess" | "trojan" => Ok(None),
+        "tuic" | "ss" | "vmess" | "trojan" | "naive+https" | "naive" => Ok(None),
         _ => Ok(None),
     }
+}
+
+/// hysteria2://<password>@host:port[/]?sni=&obfs=salamander&obfs-password=&insecure=1#name
+/// -> sing-box hysteria2 outbound. QUIC/UDP-native; always TLS (no plaintext
+/// variant), so node-safety leaves it alone. Format verified against a live
+/// ninitux node (note the trailing `/` in host:port and insecure=1).
+fn parse_hysteria2(uri: &str) -> Result<ResolvedOutbound, SubError> {
+    let rest = uri.split_once("://").map(|(_, r)| r).unwrap_or(uri);
+    let (main, fragment) = match rest.split_once('#') {
+        Some((m, f)) => (m, percent_decode(f)),
+        None => (rest, String::new()),
+    };
+    let (userinfo_host, query) = match main.split_once('?') {
+        Some((mh, q)) => (mh, q),
+        None => (main, ""),
+    };
+    let (password, hostport) = userinfo_host
+        .split_once('@')
+        .ok_or_else(|| SubError::new("hysteria2: missing password@host"))?;
+    // Panels emit host:port/ (a path); drop it before host:port parsing.
+    let hostport = hostport.split('/').next().unwrap_or(hostport);
+    let (host, port) = split_host_port(hostport)?;
+    let params = parse_query(query);
+    let get = |k: &str| q(&params, k);
+
+    let name = if fragment.is_empty() {
+        format!("{host}:{port}")
+    } else {
+        fragment
+    };
+    let mut ob = Map::new();
+    ob.insert("type".into(), json!("hysteria2"));
+    ob.insert("tag".into(), json!(name.clone()));
+    ob.insert("server".into(), json!(host));
+    ob.insert("server_port".into(), json!(port));
+    ob.insert("password".into(), json!(percent_decode(password)));
+
+    let mut tls = Map::new();
+    tls.insert("enabled".into(), json!(true));
+    tls.insert(
+        "server_name".into(),
+        json!(get("sni").or_else(|| get("peer")).unwrap_or(host)),
+    );
+    if matches!(get("insecure"), Some("1" | "true")) {
+        tls.insert("insecure".into(), json!(true));
+    }
+    let alpn = get("alpn")
+        .filter(|a| !a.is_empty())
+        .map(|a| {
+            a.split(',')
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec!["h3".to_string()]);
+    tls.insert("alpn".into(), json!(alpn));
+    ob.insert("tls".into(), Value::Object(tls));
+
+    if let Some(obfs_type) = get("obfs").filter(|o| !o.is_empty()) {
+        let mut obfs = Map::new();
+        obfs.insert("type".into(), json!(obfs_type));
+        if let Some(pw) = get("obfs-password") {
+            obfs.insert("password".into(), json!(percent_decode(pw)));
+        }
+        ob.insert("obfs".into(), Value::Object(obfs));
+    }
+
+    Ok(ResolvedOutbound {
+        name,
+        outbound: Value::Object(ob),
+    })
 }
 
 /// vless://UUID@host:port?params#name  ->  sing-box vless outbound.

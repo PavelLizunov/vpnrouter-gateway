@@ -49,10 +49,10 @@ tool output; resolved outbounds (uuid etc.) live only under `/var/lib/vpnrouter`
 
 ## Recommended next work
 
-1. **hysteria2 outbound** — the real subscription is hy2-heavy (4 of 11 nodes)
-   and hy2 is UDP-native (QUIC), better for voice/game than TCP-only
-   vless-reality. Highest-value addition for the actual use case.
-2. Client-behind-gateway **forwarding test** (LAN client → tun → WAN) — the one
-   thing not yet proven; needs a two-interface topology.
-3. Deferred items: tuic/ss/naive parsing, `pinned_outbound`/failover, full
-   doctor redaction bundle, daemon/watchdog — see docs §16.
+1. Client-behind-gateway **forwarding test** (LAN client → tun → WAN) — the one
+   thing not yet proven; needs a two-interface topology in the lab.
+2. Deferred: tuic/ss/naive parsing, `pinned_outbound`/failover, full doctor
+   redaction bundle, daemon/watchdog, proxy Level-2 host-runtime — see goal.md.
+
+Done since: hysteria2 (QUIC) parsing — real ninitux now resolves 10 nodes
+(6 vless + 4 hy2), sing-box-check green; proxy mode (Track B authoring).

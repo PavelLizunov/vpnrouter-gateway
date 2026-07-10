@@ -837,23 +837,23 @@ fn parse_singbox_json_passthrough() {
 
 #[test]
 fn parse_unsupported_only_errors() {
-    let err = parse_subscription("hysteria2://x@h:443#H\ntuic://y@h:443#T").unwrap_err();
+    let err = parse_subscription("tuic://x@h:443#H\nss://y@h:443#T").unwrap_err();
     assert!(err.0.contains("no supported outbounds"), "{}", err.0);
 }
 
 #[test]
 fn skipped_unsupported_nodes_are_named() {
-    // vless supported, hysteria2/naive skipped but surfaced (no silent cap).
+    // vless + hysteria2 supported; tuic/naive skipped but surfaced (no silent cap).
     let list = format!(
-        "{VLESS_REALITY}\nhysteria2://p@h:443#Latvia%20HY2\nnaive+https://x@h:443#LV%20NAIVE"
+        "{VLESS_REALITY}\nhysteria2://p@h:443#Germany%20HY2\ntuic://x@h:443#TU\nnaive+https://x@h:443#LV%20NAIVE"
     );
     let r = parse_subscription(&list).unwrap();
-    assert_eq!(r.outbounds.len(), 1);
-    assert_eq!(r.skipped.len(), 2);
+    assert_eq!(r.outbounds.len(), 2, "vless + hysteria2");
+    assert_eq!(r.skipped.len(), 2, "tuic + naive");
     assert!(r
         .skipped
         .iter()
-        .any(|s| s.scheme == "hysteria2" && s.name == "Latvia HY2"));
+        .any(|s| s.scheme == "tuic" && s.name == "TU"));
     assert!(r.skipped.iter().any(|s| s.scheme == "naive+https"));
 }
 
@@ -1056,6 +1056,36 @@ fn node_safety_skips_plaintext_and_reality_without_pbk() {
     // reality without pbk, as the only node -> all-unsafe error
     let s = "vless://55555555-5555-5555-5555-555555555555@e.example.com:443?security=reality&sni=x&type=tcp#Bad\n";
     assert!(subscription::parse_subscription(s).is_err());
+}
+
+#[test]
+fn parse_hysteria2_shape() {
+    // trailing / in host:port + insecure=1, as real ninitux nodes emit.
+    let uri = "hysteria2://mypassword@h.example.com:8444/?sni=h.example.com&insecure=1&obfs=salamander&obfs-password=obfspw&pair=cdn#Latvia%20HY2";
+    let parsed = subscription::parse_subscription(uri).unwrap();
+    assert_eq!(parsed.outbounds.len(), 1);
+    assert_eq!(parsed.outbounds[0].name, "Latvia HY2");
+    let o = &parsed.outbounds[0].outbound;
+    assert_eq!(o["type"], "hysteria2");
+    assert_eq!(o["server"], "h.example.com");
+    assert_eq!(o["server_port"], 8444);
+    assert_eq!(o["password"], "mypassword");
+    assert_eq!(o["tls"]["server_name"], "h.example.com");
+    assert_eq!(o["tls"]["insecure"], true);
+    assert_eq!(o["tls"]["alpn"][0], "h3");
+    assert_eq!(o["obfs"]["type"], "salamander");
+    assert_eq!(o["obfs"]["password"], "obfspw");
+}
+
+#[test]
+fn redact_masks_hysteria2_password_and_obfs() {
+    let uri = "hysteria2://secretpw@h:8444/?obfs=salamander&obfs-password=obfssecret#X";
+    let o = &subscription::parse_subscription(uri).unwrap().outbounds[0].outbound;
+    let r = crate::redact::redact_value(o);
+    assert_eq!(r["password"], "***");
+    assert_eq!(r["obfs"]["password"], "***");
+    assert_eq!(r["type"], "hysteria2");
+    assert_eq!(r["server"], "h"); // endpoint kept
 }
 
 #[test]
