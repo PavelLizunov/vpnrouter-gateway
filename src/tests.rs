@@ -210,6 +210,22 @@ fn sing_box_render_shape() {
 }
 
 #[test]
+fn ipv6_direct_omits_v6_drop_and_warns() {
+    // default (block): killswitch v6 drop present, no leak warning.
+    assert!(render::render_nft(&sample()).contains("meta nfproto ipv6 drop"));
+    // direct: v6 drop gone, IPV6_DIRECT_LEAK warning (still valid config).
+    let s = norm(SAMPLE).replace("mode = \"full\"", "mode = \"full\"\nipv6 = \"direct\"");
+    let cfg: config::GatewayConfig = toml::from_str(&s).unwrap();
+    assert!(!render::render_nft(&cfg).contains("meta nfproto ipv6 drop"));
+    let (errors, warnings) = config::validate(&cfg);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(
+        warnings.iter().any(|w| w.code == "IPV6_DIRECT_LEAK"),
+        "{warnings:?}"
+    );
+}
+
+#[test]
 fn nft_only_touches_own_table() {
     let nft = render::render_nft(&sample());
     let table_lines: Vec<&str> = nft

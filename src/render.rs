@@ -177,8 +177,9 @@ pub fn render_nft(cfg: &GatewayConfig) -> String {
             iface.lan_cidr
         ));
     }
-    if ks {
+    if ks && cfg.routing_ipv6() == crate::config::Ipv6Mode::Block {
         // sing-box config is ipv4_only; forwarded IPv6 would silently bypass it.
+        // routing.ipv6=direct opts out of this drop (v6 egresses in the clear).
         out.push_str(&format!(
             "        iifname \"{lan}\" oifname \"{wan}\" meta nfproto ipv6 drop comment \"vpnr:killswitch-v6\"\n"
         ));

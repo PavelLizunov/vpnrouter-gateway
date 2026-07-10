@@ -55,6 +55,9 @@ impl GatewayConfig {
             .expect("gateway mode validated to have [routing]")
             .mode
     }
+    pub fn routing_ipv6(&self) -> Ipv6Mode {
+        self.routing.as_ref().map_or(Ipv6Mode::Block, |r| r.ipv6)
+    }
     pub fn tun_mtu(&self) -> u16 {
         self.tun.as_ref().map_or_else(default_mtu, |t| t.mtu)
     }
@@ -178,6 +181,11 @@ pub struct Management {
 #[serde(deny_unknown_fields)]
 pub struct Routing {
     pub mode: RoutingMode,
+    /// Forwarded IPv6 handling. Default `block`: sing-box is ipv4_only, so v6
+    /// would bypass the tunnel — the killswitch drops it. `direct` lets client
+    /// v6 egress in the clear (opt-in leak) instead of losing v6 entirely.
+    #[serde(default)]
+    pub ipv6: Ipv6Mode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -185,6 +193,14 @@ pub struct Routing {
 pub enum RoutingMode {
     Full,
     Split,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Ipv6Mode {
+    #[default]
+    Block,
+    Direct,
 }
 
 #[derive(Debug, Deserialize)]
@@ -539,6 +555,12 @@ fn validate_gateway(cfg: &GatewayConfig, errors: &mut Vec<Finding>, warnings: &m
         warnings.push(Finding::new(
             "KILLSWITCH_DISABLED",
             "vpn-routed traffic will leak to WAN if the tunnel goes down; consider [killswitch] enabled = true".to_string(),
+        ));
+    }
+    if cfg.routing_ipv6() == Ipv6Mode::Direct && cfg.killswitch_enabled() {
+        warnings.push(Finding::new(
+            "IPV6_DIRECT_LEAK",
+            "routing.ipv6 = direct: forwarded IPv6 egresses in the clear (sing-box is ipv4_only); the killswitch does not cover it".to_string(),
         ));
     }
 

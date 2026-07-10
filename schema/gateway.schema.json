@@ -65,7 +65,8 @@
       "additionalProperties": false,
       "required": ["mode"],
       "properties": {
-        "mode": { "enum": ["full", "split"], "description": "full: unmatched sources go through vpn; split: unmatched sources go direct" }
+        "mode": { "enum": ["full", "split"], "description": "full: unmatched sources go through vpn; split: unmatched sources go direct" },
+        "ipv6": { "enum": ["block", "direct"], "default": "block", "description": "block: killswitch drops forwarded IPv6 (sing-box is ipv4_only). direct: v6 egresses in the clear (opt-in leak) instead of losing v6." }
       }
     },
     "tun": {
