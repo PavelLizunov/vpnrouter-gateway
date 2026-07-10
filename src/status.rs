@@ -110,7 +110,10 @@ pub fn config_in_sync(cfg: &GatewayConfig, state_dir: &Path) -> Option<bool> {
             Some(sb == render::render_proxy_sing_box(cfg, &outbounds))
         }
         Mode::Gateway => {
-            cfg.interfaces.as_ref()?; // missing [interfaces] -> skip, never panic
+            // cmd_status does not validate; a gateway config missing [interfaces]
+            // or [routing] would .expect()-panic in the gateway render. Guard both.
+            cfg.interfaces.as_ref()?;
+            cfg.routing.as_ref()?;
             let sb = std::fs::read_to_string(current.join("sing-box.json")).ok()?;
             let nft = std::fs::read_to_string(current.join("nft.rules")).ok()?;
             let resolved = crate::subscription::load_resolved(state_dir);

@@ -399,6 +399,22 @@ fn explain_block_policy_rejects() {
 // ---------- status / doctor (pure parts) ----------
 
 #[test]
+fn status_gateway_missing_routing_returns_none_not_panic() {
+    // Regression: cmd_status doesn't validate; a gateway config with [interfaces]
+    // but no [routing], with artifacts on disk, would panic in render_nft's
+    // routing_mode().expect(). config_in_sync must guard routing and return None.
+    let d = tmpdir("status-norouting");
+    std::fs::write(d.join("current").join("sing-box.json"), "x").unwrap();
+    std::fs::write(d.join("current").join("nft.rules"), "y").unwrap();
+    let broken: config::GatewayConfig = toml::from_str(
+        "[interfaces]\nwan = \"eth0\"\nlan = \"br0\"\nlan_cidr = \"192.168.10.0/24\"\n[[policies]]\nname = \"a\"\nsource = \"192.168.10.0/24\"\nroute = \"vpn\"\n",
+    )
+    .unwrap();
+    assert_eq!(crate::status::config_in_sync(&broken, &d), None);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn status_artifact_flags_and_sync() {
     let cfg = sample();
     let d = tmpdir("status");
@@ -1198,6 +1214,30 @@ fn proxy_render_matches_golden() {
     let vp: serde_json::Value = serde_json::from_str(&p).unwrap();
     assert_eq!(vp["route"]["final"], "Node B");
     assert_eq!(vp["outbounds"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn dedup_tags_collision_proof() {
+    // [A, A, A-1] must NOT produce a duplicate "A-1" tag.
+    let cfg = proxy_cfg(PROXY_URLTEST_TOML);
+    let obs = vec![
+        json!({"type":"vless","tag":"A","server":"a","server_port":443,"uuid":"u","tls":{"enabled":true,"server_name":"a"}}),
+        json!({"type":"vless","tag":"A","server":"b","server_port":443,"uuid":"u","tls":{"enabled":true,"server_name":"b"}}),
+        json!({"type":"vless","tag":"A-1","server":"c","server_port":443,"uuid":"u","tls":{"enabled":true,"server_name":"c"}}),
+    ];
+    let v: serde_json::Value =
+        serde_json::from_str(&render::render_proxy_sing_box(&cfg, &obs)).unwrap();
+    let tags: Vec<&str> = v["outbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|o| o["type"] == "vless")
+        .map(|o| o["tag"].as_str().unwrap())
+        .collect();
+    assert_eq!(tags, vec!["A", "A-1", "A-1-1"]);
+    // all unique
+    let uniq: std::collections::HashSet<_> = tags.iter().collect();
+    assert_eq!(uniq.len(), tags.len(), "duplicate tag emitted");
 }
 
 #[test]

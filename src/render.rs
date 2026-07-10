@@ -216,8 +216,10 @@ fn l4_match(p: &Policy) -> String {
 /// Deduplicate outbound tags deterministically: first occurrence keeps its name,
 /// repeats get `-1`, `-2`… in input order. Real panels DO ship duplicate display
 /// names, and every referencing tag (route.final, urltest.outbounds) must match.
+/// Collision-proof: the suffix is bumped until unique, so an input like
+/// [A, A, A-1] yields [A, A-1, A-1-1], never a duplicate tag.
 fn dedup_tags(obs: &[Value]) -> Vec<Value> {
-    let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
     obs.iter()
         .map(|ob| {
             let mut ob = ob.clone();
@@ -226,13 +228,13 @@ fn dedup_tags(obs: &[Value]) -> Vec<Value> {
                 .and_then(|t| t.as_str())
                 .unwrap_or("node")
                 .to_string();
-            let n = seen.entry(base.clone()).or_insert(0);
-            let tag = if *n == 0 {
-                base.clone()
-            } else {
-                format!("{base}-{n}")
-            };
-            *n += 1;
+            let mut tag = base.clone();
+            let mut n = 1;
+            while used.contains(&tag) {
+                tag = format!("{base}-{n}");
+                n += 1;
+            }
+            used.insert(tag.clone());
             if let Some(m) = ob.as_object_mut() {
                 m.insert("tag".to_string(), json!(tag));
             }
