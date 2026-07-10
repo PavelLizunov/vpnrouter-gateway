@@ -149,6 +149,28 @@ fn ip_forward_enabled() -> Option<bool> {
         .map(|s| s.trim() == "1")
 }
 
+/// Read-only visibility into who owns the host resolver. Informational: the
+/// gateway's own box resolver is separate from the tunnel DNS sing-box renders.
+/// Not a mutation and not a false-confidence "leak" verdict — just the facts.
+fn dns_host_check() -> Check {
+    let resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    if resolv.is_empty() {
+        return check("dns_host", "warning", "cannot read /etc/resolv.conf");
+    }
+    if resolv.contains("127.0.0.53") {
+        return check(
+            "dns_host",
+            "ok",
+            "host resolver: systemd-resolved (stub 127.0.0.53)",
+        );
+    }
+    let ns = resolv
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("nameserver "))
+        .map_or("none", str::trim);
+    check("dns_host", "ok", format!("host resolver: {ns}"))
+}
+
 pub fn cmd_status(cfg: Option<&GatewayConfig>, state_dir: &Path) -> Result<String, CliError> {
     let is_proxy = cfg.map(|c| c.mode) == Some(Mode::Proxy);
     let (current, last_good) = artifact_flags(state_dir, expected_artifacts(cfg));
@@ -291,6 +313,7 @@ fn host_doctor_checks(cfg: &GatewayConfig) -> Vec<Check> {
             "cannot read /proc/sys/net/ipv4/ip_forward",
         ),
     });
+    checks.push(dns_host_check());
     match detect_interfaces() {
         Ok(ifs) => {
             let iface = cfg.interfaces();
