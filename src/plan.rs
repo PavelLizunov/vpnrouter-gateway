@@ -6,10 +6,30 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
-use crate::config::{Finding, GatewayConfig, Protocol, Route, RoutingMode};
+use crate::config::{Finding, GatewayConfig, Mode, Protocol, Route, RoutingMode, Strategy};
 use crate::render;
+
+/// The outbounds a proxy render consumes: the single pinned outbound, or the
+/// whole pool for urltest. Single source of truth so plan/render/status agree
+/// byte-for-byte.
+pub fn proxy_outbounds(cfg: &GatewayConfig, state_dir: &Path) -> Vec<Value> {
+    let strategy = cfg
+        .subscription
+        .as_ref()
+        .map_or(Strategy::Pinned, |s| s.strategy);
+    match strategy {
+        Strategy::Pinned => crate::subscription::load_resolved(state_dir)
+            .map(|o| vec![o])
+            .unwrap_or_default(),
+        Strategy::Urltest => crate::subscription::load_cache(state_dir)
+            .ok()
+            .flatten()
+            .map(|c| c.outbounds)
+            .unwrap_or_default(),
+    }
+}
 
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/vpnrouter";
 
@@ -32,47 +52,72 @@ pub struct Assessment {
     pub risks: Vec<Risk>,
 }
 
+/// Branch by mode BEFORE any gateway field access — a proxy config has no
+/// interfaces/routing, and the gateway render path would panic on them.
 pub fn assess(
     cfg: &GatewayConfig,
     warnings: &[Finding],
     state_dir: &Path,
     ssh_connection: Option<&str>,
 ) -> Assessment {
-    let resolved = crate::subscription::load_resolved(state_dir);
-    let artifacts = [
-        (
-            "sing-box",
-            "sing-box.json",
-            render::render_sing_box(cfg, resolved.as_ref()),
-        ),
-        ("nftables", "nft.rules", render::render_nft(cfg)),
-    ];
-    let current_dir = state_dir.join("current");
-    let mut changes = Vec::new();
-    for (target, file, rendered) in &artifacts {
-        let path = current_dir.join(file);
-        let action = match std::fs::read_to_string(&path) {
-            Err(_) => Some("create"),
-            Ok(cur) if cur != *rendered => Some("replace"),
-            Ok(_) => None,
-        };
-        if let Some(action) = action {
-            changes.push(Change {
-                target,
-                action,
-                path: path.display().to_string(),
-            });
-        }
+    match cfg.mode {
+        Mode::Proxy => assess_proxy(cfg, warnings, state_dir),
+        Mode::Gateway => assess_gateway(cfg, warnings, state_dir, ssh_connection),
     }
+}
 
-    let mut risks: Vec<Risk> = warnings
+fn warnings_to_risks(warnings: &[Finding]) -> Vec<Risk> {
+    warnings
         .iter()
         .map(|w| Risk {
             level: "warning",
             code: w.code,
             message: w.message.clone(),
         })
-        .collect();
+        .collect()
+}
+
+fn diff_artifact(
+    state_dir: &Path,
+    file: &str,
+    rendered: &str,
+    target: &'static str,
+) -> Option<Change> {
+    let path = state_dir.join("current").join(file);
+    let action = match std::fs::read_to_string(&path) {
+        Err(_) => Some("create"),
+        Ok(cur) if cur != rendered => Some("replace"),
+        Ok(_) => None,
+    };
+    action.map(|action| Change {
+        target,
+        action,
+        path: path.display().to_string(),
+    })
+}
+
+fn assess_gateway(
+    cfg: &GatewayConfig,
+    warnings: &[Finding],
+    state_dir: &Path,
+    ssh_connection: Option<&str>,
+) -> Assessment {
+    let resolved = crate::subscription::load_resolved(state_dir);
+    let mut changes = Vec::new();
+    changes.extend(diff_artifact(
+        state_dir,
+        "sing-box.json",
+        &render::render_sing_box(cfg, resolved.as_ref()),
+        "sing-box",
+    ));
+    changes.extend(diff_artifact(
+        state_dir,
+        "nft.rules",
+        &render::render_nft(cfg),
+        "nftables",
+    ));
+
+    let mut risks = warnings_to_risks(warnings);
     if resolved.is_none() {
         risks.push(Risk {
             level: "warning",
@@ -87,6 +132,30 @@ pub fn assess(
             message,
         });
     }
+    Assessment { changes, risks }
+}
+
+fn assess_proxy(cfg: &GatewayConfig, warnings: &[Finding], state_dir: &Path) -> Assessment {
+    let outbounds = proxy_outbounds(cfg, state_dir);
+    let mut changes = Vec::new();
+    changes.extend(diff_artifact(
+        state_dir,
+        "sing-box.json",
+        &render::render_proxy_sing_box(cfg, &outbounds),
+        "sing-box",
+    ));
+
+    let mut risks = warnings_to_risks(warnings);
+    if outbounds.is_empty() {
+        risks.push(Risk {
+            level: "warning",
+            code: "OUTBOUND_UNRESOLVED",
+            message:
+                "no resolved outbounds; run resolve-subscription so the proxy config is connectable"
+                    .to_string(),
+        });
+    }
+    // No SSH risk in proxy mode: no routing/forward path is touched.
     Assessment { changes, risks }
 }
 
@@ -121,7 +190,11 @@ pub fn explain(
     let mut trace: Vec<serde_json::Value> = Vec::new();
     let mut verdict: Option<(&str, &str, serde_json::Value)> = None; // route, outbound, via
 
-    if let Some(m) = cfg.management.sources.iter().find(|m| m.contains(&source)) {
+    if let Some(m) = cfg
+        .management_sources()
+        .iter()
+        .find(|m| m.contains(&source))
+    {
         trace.push(json!({"stage": "management", "matched": true,
             "reason": format!("source is in management source {m}")}));
         verdict = Some(("direct", "direct", json!({"via": "management"})));
@@ -165,7 +238,7 @@ pub fn explain(
         }
     }
 
-    let (route, outbound, via) = verdict.unwrap_or_else(|| match cfg.routing.mode {
+    let (route, outbound, via) = verdict.unwrap_or_else(|| match cfg.routing_mode() {
         RoutingMode::Full => (
             "vpn",
             render::PLACEHOLDER_OUTBOUND,
@@ -178,7 +251,7 @@ pub fn explain(
         "destination is accepted but not evaluated (no destination policies in v1 schema)"
             .to_string(),
     ];
-    if route == "vpn" && cfg.killswitch.enabled {
+    if route == "vpn" && cfg.killswitch_enabled() {
         notes.push(
             "killswitch: if the tunnel is down this traffic is dropped, not leaked to WAN"
                 .to_string(),
@@ -212,7 +285,7 @@ pub fn explain(
 /// skipped: SSH is TCP.
 pub fn ssh_risk(cfg: &GatewayConfig, ssh_connection: Option<&str>) -> Option<String> {
     let client: IpAddr = ssh_connection?.split_whitespace().next()?.parse().ok()?;
-    if cfg.management.sources.iter().any(|m| m.contains(&client)) {
+    if cfg.management_sources().iter().any(|m| m.contains(&client)) {
         return None;
     }
     let first_match = cfg
@@ -226,7 +299,7 @@ pub fn ssh_risk(cfg: &GatewayConfig, ssh_connection: Option<&str>) -> Option<Str
             p.route.as_str()
         )),
         Some(_) => None,
-        None if cfg.routing.mode == RoutingMode::Full => Some(format!(
+        None if cfg.routing_mode() == RoutingMode::Full => Some(format!(
             "current SSH client {client} matches no policy and routing.mode=full sends unmatched sources through vpn; it is not in [management] sources"
         )),
         None => None,

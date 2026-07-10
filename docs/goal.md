@@ -357,7 +357,16 @@ id: A7 | track: A | priority: P2 | depends_on: none | status: todo
 
 ---
 
-### PHASE B — L1 egress fitness (ТОЛЬКО по явному go владельца)
+### PHASE B — L1 egress fitness — **ОТГРУЖЕНО authoring-часть (2026-07-11)**
+
+> **B1–B4 сделаны** (owner go = proxy-mode-spec). `mode="proxy"`: mixed-inbound
+> + pinned/urltest, без direct/dns/nft; `render --out`; apply/rollback/doctor/
+> explain отказывают `PROXY_MODE_NOT_APPLYABLE`. 57 тестов, gateway-goldens
+> байт-в-байт, живой `sing-box check` на реальной ninitux-подписке. Детали —
+> §17 [gateway-architecture.md](gateway-architecture.md). Осталось (Phase B
+> спеки, НЕ этот итер): host-runtime для proxy (Level 2). DoD Track B: DB1–DB5 ✅.
+>
+> Ниже — исходные карточки B1–B4 (status: done).
 
 > Перестройка контракта render. Ядро переиспользуется. Не начинать без §4-решения.
 

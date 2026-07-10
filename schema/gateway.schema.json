@@ -1,12 +1,22 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://vpnrouter.invalid/schemas/gateway.toml/v1",
-  "title": "vpnrouter-gateway configuration (gateway.toml), spike 0",
-  "description": "Desired state for a Linux-first sing-box edge gateway. Policies are first-match-wins in file order.",
+  "title": "vpnrouter-gateway configuration (gateway.toml)",
+  "description": "Desired state for a sing-box edge. mode=gateway (default): TUN L3 edge + nftables (needs interfaces/routing/policies). mode=proxy: mixed inbound, authoring-only (needs proxy/subscription; gateway sections forbidden). Per-mode requirements are enforced by `check`/`validate`, not by this schema.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["interfaces", "routing", "policies"],
   "properties": {
+    "mode": { "enum": ["gateway", "proxy"], "default": "gateway", "description": "gateway (default): TUN L3 edge. proxy: mixed inbound, authoring-only." },
+    "proxy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port"],
+      "description": "Required iff mode=proxy. The mixed (HTTP-CONNECT/SOCKS) inbound.",
+      "properties": {
+        "listen": { "type": "string", "default": "::", "description": "Listen address for the mixed inbound" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535, "description": "Listen port for the mixed inbound" }
+      }
+    },
     "interfaces": {
       "type": "object",
       "additionalProperties": false,
@@ -31,10 +41,23 @@
     "subscription": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["url", "active"],
+      "required": ["url"],
       "properties": {
         "url": { "type": "string", "description": "Subscription URL (secret: embeds a token, redacted in output). Resolve with `resolve-subscription`." },
-        "active": { "type": "string", "description": "Name of the outbound to select (matches share-link fragment / sing-box outbound tag)" }
+        "strategy": { "enum": ["pinned", "urltest"], "default": "pinned", "description": "pinned: one selected outbound. urltest: failover group over the whole pool (proxy-mode only)." },
+        "active": { "type": "string", "description": "Outbound to select. Required iff strategy=pinned; forbidden iff urltest." },
+        "urltest": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "urltest tuning (defaults shown).",
+          "properties": {
+            "probe_url": { "type": "string", "default": "https://www.gstatic.com/generate_204" },
+            "interval": { "type": "string", "default": "30s" },
+            "tolerance": { "type": "integer", "default": 100 },
+            "idle_timeout": { "type": "string", "default": "30m" },
+            "interrupt_existing": { "type": "boolean", "default": true }
+          }
+        }
       }
     },
     "routing": {

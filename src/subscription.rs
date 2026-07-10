@@ -30,12 +30,14 @@ pub struct ResolvedOutbound {
     pub outbound: Value,
 }
 
-/// A subscription entry we recognised but can't build yet (unsupported
-/// protocol). Surfaced so a dropped node is never a silent cap.
+/// A subscription entry we recognised but did not emit — unsupported protocol
+/// or an unsafe node (plaintext / reality-without-pbk). Surfaced with a reason
+/// so a dropped node is never a silent cap.
 #[derive(Debug, Clone)]
 pub struct Skipped {
     pub name: String,
     pub scheme: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Default)]
@@ -82,7 +84,57 @@ pub(crate) fn fetch_with_timeout(
 /// (`{...}` with an `outbounds` array), base64 of a URI list, or a plain
 /// newline-separated URI list.
 pub fn parse_subscription(body: &str) -> Result<ParseResult, SubError> {
-    parse_body(body, 0)
+    let mut result = parse_body(body, 0)?;
+    // Node-safety: never emit a plaintext or malformed-reality outbound — that
+    // would be clear egress from the origin IP, against the consumer's invariant
+    // and the tool's own killswitch spirit. Filter here, before any downstream
+    // urltest group references a tag we then drop.
+    let mut safe = Vec::with_capacity(result.outbounds.len());
+    for r in std::mem::take(&mut result.outbounds) {
+        match node_safety_reason(&r.outbound) {
+            Some(reason) => result.skipped.push(Skipped {
+                name: r.name,
+                scheme: "vless".to_string(),
+                reason,
+            }),
+            None => safe.push(r),
+        }
+    }
+    if safe.is_empty() {
+        return Err(SubError::new(format!(
+            "no usable outbounds: all {} recognised node(s) were unsupported or unsafe (plaintext / reality without pbk)",
+            result.skipped.len()
+        )));
+    }
+    result.outbounds = safe;
+    Ok(result)
+}
+
+/// vless-only: a node we would emit as a plaintext or malformed-reality outbound
+/// is unsafe. ss/trojan/hysteria2 carry their own transport crypto, so this is
+/// deliberately scoped to vless (the only protocol the parser builds today).
+fn node_safety_reason(ob: &Value) -> Option<String> {
+    if ob.get("type").and_then(|t| t.as_str()) != Some("vless") {
+        return None;
+    }
+    let tls = ob.get("tls");
+    let tls_on = tls
+        .and_then(|t| t.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if !tls_on {
+        return Some("plaintext outbound (security is neither tls nor reality)".to_string());
+    }
+    if let Some(reality) = tls.and_then(|t| t.get("reality")) {
+        let pbk = reality
+            .get("public_key")
+            .and_then(|p| p.as_str())
+            .unwrap_or("");
+        if pbk.is_empty() {
+            return Some("reality outbound without public_key (pbk)".to_string());
+        }
+    }
+    None
 }
 
 fn parse_body(body: &str, depth: u8) -> Result<ParseResult, SubError> {
@@ -137,14 +189,19 @@ fn parse_body(body: &str, depth: u8) -> Result<ParseResult, SubError> {
     })
 }
 
-/// Best-effort (name, scheme) for an entry we can't build.
+/// Best-effort (name, scheme, reason) for an entry we can't build.
 fn skipped_entry(uri: &str) -> Skipped {
     let scheme = uri.split_once("://").map_or("?", |(s, _)| s).to_string();
     let name = uri
         .rsplit_once('#')
         .map(|(_, f)| percent_decode(f))
         .unwrap_or_default();
-    Skipped { name, scheme }
+    let reason = format!("unsupported protocol {scheme}");
+    Skipped {
+        name,
+        scheme,
+        reason,
+    }
 }
 
 fn parse_singbox_json(text: &str) -> Result<ParseResult, SubError> {
@@ -407,8 +464,19 @@ pub fn select<'a>(
     })
 }
 
-/// Persist the selected outbound so render/apply can use it. Real secrets are
-/// kept (root-only dir); callers redact for display.
+/// Write a cache file 0600 — it holds real uuids. On non-unix (dev) the mode is
+/// a no-op; the target is Linux where the file lives in a root-only state dir.
+fn write_cache(path: &Path, content: &str) -> std::io::Result<()> {
+    std::fs::write(path, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Persist a single selected outbound (cache v1 = pinned case).
 pub fn save_cache(
     state_dir: &Path,
     source_url: &str,
@@ -421,15 +489,88 @@ pub fn save_cache(
         "active": chosen.name,
         "outbound": chosen.outbound,
     });
-    std::fs::write(
-        state_dir.join(CACHE_FILE),
-        serde_json::to_string_pretty(&doc).expect("cache serializes"),
+    write_cache(
+        &state_dir.join(CACHE_FILE),
+        &serde_json::to_string_pretty(&doc).expect("cache serializes"),
     )
 }
 
-/// The cached outbound object (untagged), or None if no subscription resolved.
+/// Persist all resolved outbounds (cache v2 = urltest needs the whole pool).
+pub fn save_cache_all(
+    state_dir: &Path,
+    source_url: &str,
+    active: Option<&str>,
+    outbounds: &[ResolvedOutbound],
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(state_dir)?;
+    let obs: Vec<&Value> = outbounds.iter().map(|o| &o.outbound).collect();
+    let doc = json!({
+        "v": 2,
+        "source": crate::redact::redact_url(source_url),
+        "active": active,
+        "outbounds": obs,
+    });
+    write_cache(
+        &state_dir.join(CACHE_FILE),
+        &serde_json::to_string_pretty(&doc).expect("cache serializes"),
+    )
+}
+
+/// Loaded cache, version-normalised. `outbounds` is the full pool (one entry for
+/// v1/pinned); `active` is the recorded selection if any.
+pub struct CachedSub {
+    pub active: Option<String>,
+    pub outbounds: Vec<Value>,
+}
+
+/// Read the cache. Absent -> Ok(None). Unknown version -> loud Err (so a stale
+/// or foreign cache is a clear "re-run resolve-subscription", not a silent miss).
+pub fn load_cache(state_dir: &Path) -> Result<Option<CachedSub>, SubError> {
+    let text = match std::fs::read_to_string(state_dir.join(CACHE_FILE)) {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    let doc: Value = serde_json::from_str(&text)
+        .map_err(|e| SubError::new(format!("cache is not valid JSON: {e}")))?;
+    let active = doc.get("active").and_then(|a| a.as_str()).map(String::from);
+    match doc.get("v").and_then(serde_json::Value::as_u64) {
+        Some(1) => {
+            let ob = doc
+                .get("outbound")
+                .cloned()
+                .ok_or_else(|| SubError::new("v1 cache missing 'outbound'".to_string()))?;
+            Ok(Some(CachedSub {
+                active,
+                outbounds: vec![ob],
+            }))
+        }
+        Some(2) => {
+            let outbounds = doc
+                .get("outbounds")
+                .and_then(|o| o.as_array())
+                .cloned()
+                .unwrap_or_default();
+            Ok(Some(CachedSub { active, outbounds }))
+        }
+        _ => Err(SubError::new(
+            "unrecognized subscription cache version; re-run resolve-subscription".to_string(),
+        )),
+    }
+}
+
+/// The single pinned outbound for gateway/pinned render (active, else first).
+/// Resilient: any cache problem -> None, so gateway falls back to the
+/// placeholder. Proxy paths call load_cache directly for the loud channel.
 pub fn load_resolved(state_dir: &Path) -> Option<Value> {
-    let text = std::fs::read_to_string(state_dir.join(CACHE_FILE)).ok()?;
-    let doc: Value = serde_json::from_str(&text).ok()?;
-    doc.get("outbound").cloned()
+    let cached = load_cache(state_dir).ok()??;
+    if let Some(active) = &cached.active {
+        if let Some(found) = cached
+            .outbounds
+            .iter()
+            .find(|o| o.get("tag").and_then(|t| t.as_str()) == Some(active.as_str()))
+        {
+            return Some(found.clone());
+        }
+    }
+    cached.outbounds.first().cloned()
 }

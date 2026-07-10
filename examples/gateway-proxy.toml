@@ -1,0 +1,25 @@
+# Proxy-mode example: authoring-only. vpnrouter-gateway renders a sing-box
+# config with a `mixed` inbound and a urltest failover group, no direct/nft.
+# Deploy the rendered artifact through your own pipeline (render --out DIR);
+# apply/rollback/doctor refuse in proxy mode.
+#
+#   resolve-subscription --config examples/gateway-proxy.toml --state-dir /var/lib/vpnrouter
+#   render --config examples/gateway-proxy.toml --state-dir /var/lib/vpnrouter --out ./out
+
+mode = "proxy"
+
+[proxy]
+listen = "::"
+port = 12080
+
+[subscription]
+# The URL is a secret (embeds a token) — redacted in all output.
+url = "https://example.com/sub"
+strategy = "urltest" # pinned | urltest (urltest = failover over the whole pool)
+
+[subscription.urltest]
+probe_url = "https://www.gstatic.com/generate_204"
+interval = "30s"
+tolerance = 100
+idle_timeout = "30m"
+interrupt_existing = true

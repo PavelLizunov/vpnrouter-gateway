@@ -2,8 +2,10 @@
 
 Headless Linux-first edge gateway: `gateway.toml -> validate -> render
 (sing-box 1.13 JSON + nftables) -> plan -> apply --yes ->
-status/doctor/explain -> rollback`. Rust, один бинарь, пять зависимостей
-(serde, serde_json, toml, ipnet, lexopt). Вся архитектура, вердикты и
+status/doctor/explain -> rollback`. Плюс `mode = "proxy"` (Track B, §17):
+mixed-inbound authoring-only (render --out), без direct/dns/nft, apply отказывает.
+Rust, один бинарь, шесть зависимостей
+(serde, serde_json, toml, ipnet, lexopt, ureq). Вся архитектура, вердикты и
 live-валидация: [docs/gateway-architecture.md](docs/gateway-architecture.md).
 
 ## Команды
@@ -22,6 +24,9 @@ live-валидация: [docs/gateway-architecture.md](docs/gateway-architectur
 ## Инварианты (не ломать)
 
 - Детерминизм render: байт-в-байт, закреплено golden-тестами.
+- Добавление режимов не должно сдвигать gateway-goldens (proxy — отдельная
+  `render_proxy_sing_box`, не шарит код). `UPDATE_GOLDEN` на gateway-golden
+  обязан давать нулевой дифф.
 - nftables: только собственная таблица `inet vpnrouter`; `flush ruleset`
   запрещён навсегда.
 - Мутации хоста только в `apply`/`rollback` и только с `--yes`; остальные

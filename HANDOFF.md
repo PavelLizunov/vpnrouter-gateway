@@ -4,16 +4,19 @@ Headless Linux VPN gateway (Rust + sing-box + nftables). Full design,
 decisions, and live-validation log: [docs/gateway-architecture.md](docs/gateway-architecture.md).
 Invariants and workflow: [CLAUDE.md](CLAUDE.md). Deploy: [packaging/README.md](packaging/README.md).
 
-## Status (2026-07-09)
+## Status (2026-07-11)
 
-v1 CLI complete: `gateway.toml → validate → render (sing-box 1.13 + nftables)
-→ plan → apply --yes → status/doctor/explain → rollback → resolve-subscription`.
-4 commits on `main`, 44 tests, clippy `-D warnings` + fmt clean, blocking
-pre-commit hook. Live-validated on Proxmox LXC (Debian 12 / Alpine 3.23) AND
-against a real ninitux subscription: 6 vless nodes resolve, real sing-box
-1.13.14 accepts the rendered configs, and a connectivity test egresses at the
-German server (DE). apply refuses a config sing-box rejects (proven with a bad
-reality short_id) — a bad subscription can't brick the box.
+v1 gateway CLI + **proxy mode (Track B authoring)** complete. Gateway:
+`gateway.toml → validate → render (sing-box 1.13 + nftables) → plan →
+apply --yes → status/doctor/explain → rollback → resolve-subscription`. Proxy:
+`mode="proxy"` → mixed inbound + pinned/urltest, no direct/dns/nft, `render
+--out` (apply/rollback/doctor refuse). 57 tests, clippy `-D warnings` + fmt
+clean, blocking pre-commit hook, gateway goldens byte-identical. Live-validated
+on Proxmox LXC (Debian 12 / Alpine 3.23): gateway apply/rollback/kill-switch;
+real ninitux subscription resolves; real sing-box 1.13.14 accepts both gateway
+AND proxy (urltest, 6 vless, domain servers) renders; gateway connectivity
+egresses DE; bad reality short_id → apply refuses (can't brick the box). See
+[docs/gateway-architecture.md](docs/gateway-architecture.md) §17 for proxy mode.
 
 ## Build on the target server (native Linux — the boring path)
 

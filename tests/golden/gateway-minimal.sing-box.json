@@ -1,0 +1,78 @@
+{
+  "dns": {
+    "final": "vpn-dns",
+    "servers": [
+      {
+        "detour": "vpn-out",
+        "server": "1.1.1.1",
+        "tag": "vpn-dns",
+        "type": "https"
+      },
+      {
+        "server": "1.1.1.1",
+        "tag": "local-dns",
+        "type": "https"
+      }
+    ],
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [
+    {
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "auto_route": true,
+      "interface_name": "vpnr-tun",
+      "mtu": 1420,
+      "stack": "system",
+      "strict_route": false,
+      "tag": "tun-in",
+      "type": "tun"
+    }
+  ],
+  "log": {
+    "level": "info"
+  },
+  "outbounds": [
+    {
+      "server": "placeholder.invalid",
+      "server_port": 443,
+      "tag": "vpn-out",
+      "tls": {
+        "enabled": true,
+        "server_name": "placeholder.invalid"
+      },
+      "type": "vless",
+      "uuid": "00000000-0000-0000-0000-000000000000"
+    },
+    {
+      "tag": "direct",
+      "type": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_domain_resolver": "local-dns",
+    "final": "vpn-out",
+    "rules": [
+      {
+        "action": "sniff",
+        "timeout": "300ms"
+      },
+      {
+        "action": "hijack-dns",
+        "protocol": "dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      },
+      {
+        "outbound": "vpn-out",
+        "source_ip_cidr": [
+          "192.168.10.0/24"
+        ]
+      }
+    ]
+  }
+}

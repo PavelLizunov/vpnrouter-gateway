@@ -8,7 +8,7 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::config::GatewayConfig;
+use crate::config::{GatewayConfig, Mode};
 use crate::error::{ok_envelope, CliError};
 use crate::render;
 
@@ -80,27 +80,46 @@ pub fn detect_interfaces() -> Result<Vec<InterfaceInfo>, CliError> {
     })
 }
 
-/// (current artifacts present, last-good present)
-pub fn artifact_flags(state_dir: &Path) -> (bool, bool) {
-    let all = |dir: &Path| {
-        ["sing-box.json", "nft.rules"]
-            .iter()
-            .all(|f| dir.join(f).exists())
-    };
+/// Artifacts a mode is expected to produce. Proxy renders only sing-box.json;
+/// gateway also renders nft.rules.
+fn expected_artifacts(cfg: Option<&GatewayConfig>) -> &'static [&'static str] {
+    match cfg.map(|c| c.mode) {
+        Some(Mode::Proxy) => &["sing-box.json"],
+        _ => &["sing-box.json", "nft.rules"],
+    }
+}
+
+/// (current artifacts present, last-good present) for the given expected files.
+pub fn artifact_flags(state_dir: &Path, files: &[&str]) -> (bool, bool) {
+    let all = |dir: &Path| files.iter().all(|f| dir.join(f).exists());
     (
         all(&state_dir.join("current")),
         all(&state_dir.join("last-good")),
     )
 }
 
-/// None when current artifacts are absent; Some(true) when they match what
-/// this config renders (i.e. config not edited since last apply).
+/// None when current artifacts are absent; Some(true) when they match what this
+/// config renders. Branches by mode BEFORE any gateway render, and guards a
+/// gateway config missing [interfaces] (cmd_status does not validate first).
 pub fn config_in_sync(cfg: &GatewayConfig, state_dir: &Path) -> Option<bool> {
     let current = state_dir.join("current");
-    let sb = std::fs::read_to_string(current.join("sing-box.json")).ok()?;
-    let nft = std::fs::read_to_string(current.join("nft.rules")).ok()?;
-    let resolved = crate::subscription::load_resolved(state_dir);
-    Some(sb == render::render_sing_box(cfg, resolved.as_ref()) && nft == render::render_nft(cfg))
+    match cfg.mode {
+        Mode::Proxy => {
+            let sb = std::fs::read_to_string(current.join("sing-box.json")).ok()?;
+            let outbounds = crate::plan::proxy_outbounds(cfg, state_dir);
+            Some(sb == render::render_proxy_sing_box(cfg, &outbounds))
+        }
+        Mode::Gateway => {
+            cfg.interfaces.as_ref()?; // missing [interfaces] -> skip, never panic
+            let sb = std::fs::read_to_string(current.join("sing-box.json")).ok()?;
+            let nft = std::fs::read_to_string(current.join("nft.rules")).ok()?;
+            let resolved = crate::subscription::load_resolved(state_dir);
+            Some(
+                sb == render::render_sing_box(cfg, resolved.as_ref())
+                    && nft == render::render_nft(cfg),
+            )
+        }
+    }
 }
 
 /// nft probe: (binary_found, table_present, error). `table_present` is None
@@ -131,16 +150,26 @@ fn ip_forward_enabled() -> Option<bool> {
 }
 
 pub fn cmd_status(cfg: Option<&GatewayConfig>, state_dir: &Path) -> Result<String, CliError> {
-    let (current, last_good) = artifact_flags(state_dir);
+    let is_proxy = cfg.map(|c| c.mode) == Some(Mode::Proxy);
+    let (current, last_good) = artifact_flags(state_dir, expected_artifacts(cfg));
     let in_sync = cfg.and_then(|c| config_in_sync(c, state_dir));
-    let (nft_bin, table, nft_err) = if cfg!(target_os = "linux") {
-        nft_probe()
+    // nftables is a gateway concern; proxy mode owns no host table.
+    let nftables = if is_proxy {
+        json!({ "applicable": false })
+    } else if cfg!(target_os = "linux") {
+        let (nft_bin, table, nft_err) = nft_probe();
+        json!({ "binary_found": nft_bin, "table_present": table, "error": nft_err })
     } else {
-        (false, None, Some("unsupported platform".to_string()))
+        json!({ "binary_found": false, "table_present": null, "error": "unsupported platform" })
     };
-    let interfaces = detect_interfaces().ok();
+    let interfaces = if is_proxy {
+        None
+    } else {
+        detect_interfaces().ok()
+    };
     let resolved = crate::subscription::load_resolved(state_dir);
     Ok(ok_envelope(json!({
+        "mode": if is_proxy { "proxy" } else { "gateway" },
         "artifacts": {
             "current": current,
             "last_good": last_good,
@@ -150,11 +179,7 @@ pub fn cmd_status(cfg: Option<&GatewayConfig>, state_dir: &Path) -> Result<Strin
             "configured": cfg.map(|c| c.subscription.is_some()),
             "outbound_resolved": resolved.is_some(),
         },
-        "nftables": {
-            "binary_found": nft_bin,
-            "table_present": table,
-            "error": nft_err,
-        },
+        "nftables": nftables,
         "interfaces": interfaces,
     })))
 }
@@ -188,7 +213,7 @@ pub fn pure_doctor_checks(
             format!("{}: {}", w.code, w.message),
         ));
     }
-    let (current, last_good) = artifact_flags(state_dir);
+    let (current, last_good) = artifact_flags(state_dir, expected_artifacts(Some(cfg)));
     if current {
         match config_in_sync(cfg, state_dir) {
             Some(true) => checks.push(check(
@@ -268,7 +293,8 @@ fn host_doctor_checks(cfg: &GatewayConfig) -> Vec<Check> {
     });
     match detect_interfaces() {
         Ok(ifs) => {
-            for (role, name) in [("wan", &cfg.interfaces.wan), ("lan", &cfg.interfaces.lan)] {
+            let iface = cfg.interfaces();
+            for (role, name) in [("wan", &iface.wan), ("lan", &iface.lan)] {
                 checks.push(match ifs.iter().find(|i| &i.name == name) {
                     Some(i) => check(
                         "interfaces",

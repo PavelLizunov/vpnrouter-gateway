@@ -37,8 +37,8 @@ fn sample_parses_and_validates_clean() {
     let cfg = sample();
     assert_eq!(cfg.policies.len(), 2);
     assert_eq!(cfg.policies[0].name, "voice-udp");
-    assert_eq!(cfg.management.sources.len(), 1);
-    assert!(cfg.killswitch.enabled);
+    assert_eq!(cfg.management_sources().len(), 1);
+    assert!(cfg.killswitch_enabled());
     let (errors, warnings) = config::validate(&cfg);
     assert!(errors.is_empty(), "{errors:?}");
     assert!(warnings.is_empty(), "{warnings:?}");
@@ -386,10 +386,11 @@ fn explain_block_policy_rejects() {
 fn status_artifact_flags_and_sync() {
     let cfg = sample();
     let d = tmpdir("status");
-    assert_eq!(crate::status::artifact_flags(&d), (false, false));
+    let files: &[&str] = &["sing-box.json", "nft.rules"];
+    assert_eq!(crate::status::artifact_flags(&d, files), (false, false));
     assert_eq!(crate::status::config_in_sync(&cfg, &d), None);
     do_apply(&cfg, &d, None, yes(), &mut FakeNft::default()).unwrap();
-    assert_eq!(crate::status::artifact_flags(&d), (true, false));
+    assert_eq!(crate::status::artifact_flags(&d, files), (true, false));
     assert_eq!(crate::status::config_in_sync(&cfg, &d), Some(true));
     // edit config -> drift
     let changed: config::GatewayConfig =
@@ -822,8 +823,10 @@ fn parse_json_wrapper_ninitux_shape() {
 
 #[test]
 fn parse_singbox_json_passthrough() {
+    // JP carries tls so it survives the node-safety filter; the test's point is
+    // that proxy outbounds are kept while direct/selector are dropped.
     let json = r#"{"outbounds":[
-        {"type":"vless","tag":"JP","server":"jp.example","server_port":443,"uuid":"u"},
+        {"type":"vless","tag":"JP","server":"jp.example","server_port":443,"uuid":"u","tls":{"enabled":true,"server_name":"jp.example"}},
         {"type":"direct","tag":"direct"},
         {"type":"selector","tag":"select","outbounds":["JP"]}
     ]}"#;
@@ -911,6 +914,293 @@ fn fetch_times_out_on_silent_server() {
         start.elapsed()
     );
     drop(listener);
+}
+
+// ---------- proxy mode ----------
+
+const PROXY_SUB: &str = include_str!("../tests/fixtures/proxy-sub.txt");
+const PROXY_EXAMPLE: &str = include_str!("../examples/gateway-proxy.toml");
+const GOLDEN_PROXY_URLTEST: &str = include_str!("../tests/golden/proxy-urltest.sing-box.json");
+const GOLDEN_PROXY_PINNED: &str = include_str!("../tests/golden/proxy-pinned.sing-box.json");
+const GOLDEN_GATEWAY_MINIMAL: &str = include_str!("../tests/golden/gateway-minimal.sing-box.json");
+
+const PROXY_URLTEST_TOML: &str = r#"
+mode = "proxy"
+[proxy]
+port = 12080
+[subscription]
+url = "https://example.com/sub"
+strategy = "urltest"
+"#;
+
+const PROXY_PINNED_TOML: &str = r#"
+mode = "proxy"
+[proxy]
+listen = "127.0.0.1"
+port = 12080
+[subscription]
+url = "https://example.com/sub"
+strategy = "pinned"
+active = "Node B"
+"#;
+
+// Gateway config OMITTING tun/dns/killswitch/management/subscription — locks the
+// None->default render so an omitted section can never silently shift bytes.
+const GATEWAY_MINIMAL_TOML: &str = r#"
+[interfaces]
+wan = "eth0"
+lan = "br0"
+lan_cidr = "192.168.10.0/24"
+[routing]
+mode = "full"
+[[policies]]
+name = "all"
+source = "192.168.10.0/24"
+route = "vpn"
+"#;
+
+fn proxy_cfg(s: &str) -> config::GatewayConfig {
+    toml::from_str(s).expect("proxy config parses")
+}
+
+fn fixture_outbounds() -> Vec<serde_json::Value> {
+    subscription::parse_subscription(PROXY_SUB)
+        .unwrap()
+        .outbounds
+        .iter()
+        .map(|o| o.outbound.clone())
+        .collect()
+}
+
+fn err_codes(s: &str) -> Vec<&'static str> {
+    let cfg: config::GatewayConfig = toml::from_str(s).expect("test config parses");
+    config::validate(&cfg).0.iter().map(|f| f.code).collect()
+}
+
+#[test]
+fn proxy_example_validates_and_schema_has_proxy() {
+    let cfg: config::GatewayConfig = toml::from_str(&norm(PROXY_EXAMPLE)).unwrap();
+    assert_eq!(cfg.mode, config::Mode::Proxy);
+    assert!(
+        config::validate(&cfg).0.is_empty(),
+        "proxy example must validate clean"
+    );
+    let schema: serde_json::Value = serde_json::from_str(crate::SCHEMA).unwrap();
+    assert!(schema["properties"]["mode"].is_object());
+    assert!(schema["properties"]["proxy"].is_object());
+}
+
+#[test]
+fn proxy_config_parses_and_defaults() {
+    let cfg = proxy_cfg(PROXY_URLTEST_TOML);
+    assert_eq!(cfg.mode, config::Mode::Proxy);
+    let p = cfg.proxy.as_ref().unwrap();
+    assert_eq!(p.listen, "::");
+    assert_eq!(p.port, 12080);
+    assert_eq!(
+        cfg.subscription.as_ref().unwrap().strategy,
+        config::Strategy::Urltest
+    );
+    assert!(config::validate(&cfg).0.is_empty());
+}
+
+#[test]
+fn gateway_minimal_validates_with_defaults() {
+    let cfg = proxy_cfg(GATEWAY_MINIMAL_TOML);
+    assert_eq!(cfg.mode, config::Mode::Gateway);
+    assert_eq!(cfg.tun_mtu(), 1420);
+    assert_eq!(cfg.dns_mode(), config::DnsMode::Tunneled);
+    assert!(!cfg.killswitch_enabled());
+    assert!(config::validate(&cfg).0.is_empty());
+}
+
+#[test]
+fn proxy_missing_port_is_parse_error() {
+    let s = "mode=\"proxy\"\n[proxy]\nlisten=\"::\"\n[subscription]\nurl=\"https://x/s\"\nstrategy=\"urltest\"\n";
+    assert!(toml::from_str::<config::GatewayConfig>(s).is_err());
+}
+
+#[test]
+fn proxy_validation_matrix() {
+    assert!(err_codes(
+        "mode=\"proxy\"\n[subscription]\nurl=\"https://x/s\"\nstrategy=\"urltest\"\n"
+    )
+    .contains(&"PROXY_SECTION_REQUIRED"));
+    let conflict = err_codes("mode=\"proxy\"\n[proxy]\nport=12080\n[subscription]\nurl=\"https://x/s\"\nstrategy=\"urltest\"\n[tun]\nmtu=1400\n");
+    assert!(conflict.contains(&"PROXY_MODE_SECTION_CONFLICT"));
+    assert!(
+        err_codes("mode=\"proxy\"\n[proxy]\nport=12080\n").contains(&"PROXY_SUBSCRIPTION_REQUIRED")
+    );
+    assert!(err_codes("mode=\"proxy\"\n[proxy]\nport=0\n[subscription]\nurl=\"https://x/s\"\nstrategy=\"urltest\"\n")
+        .contains(&"PORT_INVALID"));
+    assert!(err_codes("mode=\"proxy\"\n[proxy]\nport=12080\n[subscription]\nurl=\"https://x/s\"\nstrategy=\"pinned\"\n")
+        .contains(&"SUBSCRIPTION_ACTIVE_EMPTY"));
+    assert!(err_codes("mode=\"proxy\"\n[proxy]\nport=12080\n[subscription]\nurl=\"https://x/s\"\nstrategy=\"urltest\"\nactive=\"X\"\n")
+        .contains(&"URLTEST_ACTIVE_CONFLICT"));
+    assert!(err_codes("[interfaces]\nwan=\"e\"\nlan=\"b\"\nlan_cidr=\"10.0.0.0/24\"\n[routing]\nmode=\"full\"\n[[policies]]\nname=\"a\"\nsource=\"10.0.0.0/24\"\nroute=\"vpn\"\n[subscription]\nurl=\"https://x/s\"\nstrategy=\"urltest\"\n")
+        .contains(&"URLTEST_GATEWAY_UNSUPPORTED"));
+    assert!(err_codes("[routing]\nmode=\"full\"\n[[policies]]\nname=\"a\"\nsource=\"10.0.0.0/24\"\nroute=\"direct\"\n")
+        .contains(&"GATEWAY_INTERFACES_REQUIRED"));
+    assert!(err_codes("mode=\"proxy\"\n[proxy]\nport=12080\n[subscription]\nurl=\"ftp://x\"\nstrategy=\"urltest\"\n")
+        .contains(&"SUBSCRIPTION_URL_INVALID"));
+}
+
+#[test]
+fn node_safety_skips_plaintext_and_reality_without_pbk() {
+    let parsed = subscription::parse_subscription(PROXY_SUB).unwrap();
+    assert_eq!(parsed.outbounds.len(), 3, "Node A x2 + Node B usable");
+    assert!(parsed
+        .skipped
+        .iter()
+        .any(|s| s.name == "Node C" && s.reason.contains("plaintext")));
+    // reality without pbk, as the only node -> all-unsafe error
+    let s = "vless://55555555-5555-5555-5555-555555555555@e.example.com:443?security=reality&sni=x&type=tcp#Bad\n";
+    assert!(subscription::parse_subscription(s).is_err());
+}
+
+#[test]
+fn cache_v2_roundtrip_and_v1_compat() {
+    let d = tmpdir("cachev2");
+    let parsed = subscription::parse_subscription(PROXY_SUB).unwrap();
+    subscription::save_cache_all(&d, "https://sub.example/t", None, &parsed.outbounds).unwrap();
+    let cached = subscription::load_cache(&d).unwrap().unwrap();
+    assert_eq!(cached.outbounds.len(), 3);
+    assert!(cached.active.is_none());
+    assert!(subscription::load_resolved(&d).is_some());
+    let cache_doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.join("subscription.json")).unwrap())
+            .unwrap();
+    assert_eq!(cache_doc["v"], 2);
+    assert_eq!(cache_doc["source"], "https://sub.example/…");
+
+    let d1 = tmpdir("cachev1");
+    let chosen = subscription::select(&parsed.outbounds, "Node B").unwrap();
+    subscription::save_cache(&d1, "https://s/t", chosen).unwrap();
+    let c1 = subscription::load_cache(&d1).unwrap().unwrap();
+    assert_eq!(c1.outbounds.len(), 1);
+    assert_eq!(c1.active.as_deref(), Some("Node B"));
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&d1);
+}
+
+#[test]
+fn cache_unknown_version_errors() {
+    let d = tmpdir("cacheunk");
+    std::fs::write(d.join("subscription.json"), r#"{"v":99,"outbounds":[]}"#).unwrap();
+    assert!(subscription::load_cache(&d).is_err());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn proxy_render_matches_golden() {
+    let cfg_u = proxy_cfg(PROXY_URLTEST_TOML);
+    let obs = fixture_outbounds();
+    let u = render::render_proxy_sing_box(&cfg_u, &obs);
+
+    let cfg_p = proxy_cfg(PROXY_PINNED_TOML);
+    let parsed = subscription::parse_subscription(PROXY_SUB).unwrap();
+    let node_b = &subscription::select(&parsed.outbounds, "Node B")
+        .unwrap()
+        .outbound;
+    let p = render::render_proxy_sing_box(&cfg_p, std::slice::from_ref(node_b));
+
+    let cfg_g = proxy_cfg(GATEWAY_MINIMAL_TOML);
+    let g = render::render_sing_box(&cfg_g, None);
+
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        std::fs::write("tests/golden/proxy-urltest.sing-box.json", &u).unwrap();
+        std::fs::write("tests/golden/proxy-pinned.sing-box.json", &p).unwrap();
+        std::fs::write("tests/golden/gateway-minimal.sing-box.json", &g).unwrap();
+    }
+    assert_eq!(
+        norm(&u),
+        norm(GOLDEN_PROXY_URLTEST),
+        "proxy urltest render drifted"
+    );
+    assert_eq!(
+        norm(&p),
+        norm(GOLDEN_PROXY_PINNED),
+        "proxy pinned render drifted"
+    );
+    assert_eq!(
+        norm(&g),
+        norm(GOLDEN_GATEWAY_MINIMAL),
+        "gateway-minimal render drifted"
+    );
+
+    // determinism
+    assert_eq!(u, render::render_proxy_sing_box(&cfg_u, &obs));
+
+    // dedup: duplicate "Node A" -> Node A / Node A-1, and urltest references them
+    let v: serde_json::Value = serde_json::from_str(&u).unwrap();
+    let tags: Vec<&str> = v["outbounds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|o| o["type"] == "vless")
+        .map(|o| o["tag"].as_str().unwrap())
+        .collect();
+    assert_eq!(tags, vec!["Node A", "Node A-1", "Node B"]);
+    assert_eq!(v["route"]["final"], "auto");
+    assert_eq!(v["inbounds"][0]["type"], "mixed");
+    assert!(
+        !u.contains("\"direct\""),
+        "no direct outbound in proxy mode"
+    );
+    assert!(!v.as_object().unwrap().contains_key("dns"), "no dns block");
+
+    let vp: serde_json::Value = serde_json::from_str(&p).unwrap();
+    assert_eq!(vp["route"]["final"], "Node B");
+    assert_eq!(vp["outbounds"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn proxy_plan_singbox_only_no_ssh_risk() {
+    let cfg = proxy_cfg(PROXY_URLTEST_TOML);
+    let d = tmpdir("proxyplan");
+    let out = plan::build_plan(&cfg, &[], Path::new("x"), &d, Some("192.168.10.77 5 1 22"));
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let changes = v["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1, "proxy renders sing-box only, no nft");
+    assert_eq!(changes[0]["target"], "sing-box");
+    let risks = v["risks"].as_array().unwrap();
+    assert!(risks.iter().any(|r| r["code"] == "OUTBOUND_UNRESOLVED"));
+    assert!(!risks.iter().any(|r| r["code"] == "SSH_MAY_DROP"));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn proxy_mode_refuses_host_commands() {
+    let err = crate::refuse_if_proxy(&proxy_cfg(PROXY_URLTEST_TOML)).unwrap_err();
+    assert_eq!(err.code, "PROXY_MODE_NOT_APPLYABLE");
+    assert_eq!(err.exit, 2);
+    assert!(crate::refuse_if_proxy(&sample()).is_ok());
+}
+
+#[test]
+fn render_command_envelope_is_content_free() {
+    let d = tmpdir("rendercmd");
+    let cfgfile = d.join("proxy.toml");
+    std::fs::write(&cfgfile, PROXY_URLTEST_TOML).unwrap();
+    subscription::save_cache_all(
+        &d,
+        "https://x/s",
+        None,
+        &subscription::parse_subscription(PROXY_SUB)
+            .unwrap()
+            .outbounds,
+    )
+    .unwrap();
+    let out = crate::cmd_render(&cfgfile, &d, Some(d.join("out"))).unwrap();
+    assert!(
+        !out.contains("11111111-1111"),
+        "render envelope leaked a uuid"
+    );
+    assert!(out.contains("\"bytes\""));
+    // the real uuid IS on disk (root-only artifact), just never in the envelope
+    let rendered = std::fs::read_to_string(d.join("out").join("sing-box.json")).unwrap();
+    assert!(rendered.contains("11111111-1111"));
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 #[test]
