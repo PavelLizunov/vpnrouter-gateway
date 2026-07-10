@@ -655,4 +655,36 @@ gateway-minimal для None→default). Файлы: [config.rs](../src/config.rs
 [schema](../schema/gateway.schema.json), [examples/gateway-proxy.toml](../examples/gateway-proxy.toml).
 
 Не сделано (Phase B спеки): host-runtime для proxy (systemd на боксе,
-nft-less apply/doctor) — Level 2. hysteria2/tuic парсинг — отдельный roadmap.
+nft-less apply/doctor) — Level 2.
+
+## 18. hysteria2 + forwarding e2e — Track A закрыт на железе (2026-07-11)
+
+**hysteria2 (A2):** parse_hysteria2 под живой формат ninitux
+(`hysteria2://pw@host:port/?sni=&insecure=1&obfs=salamander&obfs-password=`;
+хвостовой `/` в host:port срезается). QUIC/UDP-native, всегда TLS → node-safety
+не трогает; password+obfs.password редактятся. Реальная подписка теперь
+резолвит **10 узлов** (6 vless + 4 hy2, только naive в skipped); смешанный
+vless+hy2 urltest-рендер принят реальным `sing-box check` 1.13.14.
+
+**Forwarding e2e (A1, DA2/DA3) — единственный непроверенный слой Track A,
+теперь доказан на реальном железе.** Стенд Proxmox: привилегированная
+gateway-CT (tun-passthrough, eth0=WAN + eth1=LAN 10.10.10.1/24) + внутренний
+мост vmbr1 + клиентская CT (10.10.10.2, default route через шлюз). На шлюзе:
+resolve реальной ninitux (Germany VLESS) → `apply --yes` (nft + real outbound)
+→ sing-box (tun `vpnr-tun` up).
+- **DA2:** клиент за шлюзом `curl api.ipify.org` → **104.194.156.93 / DE**:
+  трафик прошёл client → шлюз (route) → tun (auto_route) → sing-box → немецкий
+  сервер. DNS через туннель (домены резолвятся), NAT (клиент поставил apt через
+  туннель), MTU (крупный HTTPS прошёл).
+- **DA3 kill-switch на forward-хуке:** sing-box убит → tun исчез → клиент
+  **DROPPED** (curl rc=28, без утечки в WAN). Правило
+  `iifname eth1 oifname eth0 ip saddr 10.10.10.0/24 drop` блокирует downstream-
+  клиента при падении туннеля. **Это ровно та дыра desktop'а** из §3 (там
+  killswitch висел только на `output`, forward не покрыт) — здесь закрыта и
+  доказана. Restart sing-box → клиент восстановился.
+
+**Прочее:** A3 (doctor репортит host-резолвер), A7 (CI GitHub Actions зеркалит
+gate + cargo audit, зелёный). A4 (IPv6-direct knob) осознанно отложен —
+blunt-drop v6 безопасен, opt-in-knob никто не просил (ponytail). A5 (daemon) —
+не строим: systemd `Restart=on-failure` покрывает без своего reconcile-loop.
+Стенд test-scoped, убран после прогона (persistent-лаборатория 103/104 цела).
