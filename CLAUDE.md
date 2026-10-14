@@ -28,7 +28,6 @@ live-валидация: [docs/gateway-architecture.md](docs/gateway-architectur
   `render_proxy_sing_box`, не шарит код). `UPDATE_GOLDEN` на gateway-golden
   обязан давать нулевой дифф.
 - nftables: только собственная таблица `inet vpnrouter`; `flush ruleset`
-  запрещён навсегда.
 - Мутации хоста только в `apply`/`rollback` и только с `--yes`; остальные
   команды read-only по построению.
 - Порядок apply: `nft -c` кандидата ДО любых изменений → backup current в
@@ -49,8 +48,6 @@ live-валидация: [docs/gateway-architecture.md](docs/gateway-architectur
   `fmt --check` + `clippy -D warnings` + `cargo test`. `--no-verify` — только
   для ≤5-строчного однофайлового hotfix.
 - Не push и не release без явного go владельца.
-- Секретов в конфиге пока нет; redaction обязателен с появлением
-  `[subscription]` (URL подписки = секрет).
 
 ## User-directed execution: prohibiting invented prohibitions
 
