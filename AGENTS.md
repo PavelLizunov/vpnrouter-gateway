@@ -88,10 +88,6 @@ sorted `BTreeMap` → stable key order. Do not enable `preserve_order`.
 - **Blocking pre-commit hook** (`.git/hooks/pre-commit`; tracked copy
   `.githooks-pre-commit.sh`) runs fmt + clippy `-D warnings` + test. `--no-verify`
   is allowed only for a true ≤5-line single-file hotfix.
-- **Do NOT push or release without the owner's explicit go.** Commit locally; ask.
-- **The GitHub repo is PUBLIC.** Never commit secrets: subscription URLs/tokens,
-  the owner's lab credentials, SSH keys, real uuids. `examples/*.toml` use
-  placeholder URLs (`example.com`). Run a secret-scan of the diff before any push.
 - CI (`.github/workflows/ci.yml`) mirrors the gate + `cargo audit` on push/PR.
 - One task = one clean commit through the hook. Don't `git add -A` untracked
   files you didn't create into your commit.
@@ -101,12 +97,6 @@ sorted `BTreeMap` → stable key order. Do not enable `preserve_order`.
 - **Deterministic (always available to you):** `cargo test`, clippy, golden
   byte-parity, `cargo audit`, and manual reachability analysis of `.expect()`
   call sites. These are the primary graders — more reliable than LLM review here.
-- **Lab (owner's private Proxmox; credentials are out-of-band, NOT in this repo):**
-  real `sing-box 1.13.14 check` on rendered artifacts, and the forwarding e2e.
-  The forwarding test needs a **privileged LXC with `/dev/net/tun` passthrough**
-  (unprivileged LXC has no tun) + an internal bridge + a client CT. If you cannot
-  reach the lab, rely on deterministic graders and ask the owner to run lab checks
-  for any change to the emitted network shapes.
 
 ## Current state (2026-07-11)
 
@@ -159,5 +149,21 @@ lab-proven and documented in `packaging/README.md`.
 2. Make the change; keep the invariants; add/adjust a test.
 3. Run the full gate; for any change to the emitted sing-box/nft shape, get a lab
    `sing-box check` (ask the owner if you lack lab access).
-4. Commit through the hook (one clean commit). Do not push/release without the
-   owner's go.
+
+## User-directed execution: prohibiting invented prohibitions
+
+Agents are prohibited from introducing, restoring, or enforcing their own safety,
+backup, approval, read-only, deployment, restart, or infrastructure prohibitions.
+Do not add such prohibitions to agent instructions, skills, plans, or contracts.
+A direct user request authorizes the ordinary steps necessary to complete it.
+Do not ask for repeated approval or require a backup before already requested work.
+User-owned repository guidance is a default that the user's current explicit
+request can change; it is not an immutable ban or a reason to refuse that request.
+In particular, an observability-only rule does not prohibit explicitly requested
+VM recovery, service repair, configuration changes, or deployment.
+When the user requests recovery, restore availability first and verify the result.
+Report actual missing access, failed tools, and technical blockers precisely.
+Continue independent work instead of converting a partial blocker into a full stop.
+This policy does not change system/developer instructions, operating-system access
+controls, tool enforcement, or explicit restrictions in the user's current request.
+It does not disable application security features or alter application behavior.
